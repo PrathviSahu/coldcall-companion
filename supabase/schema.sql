@@ -255,41 +255,43 @@ begin
     -- Transaction-level advisory lock serializes concurrent syncs with the exact same caller & client_call_id
     perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext(p_caller_id || ':' || v_clean_client_id));
 
-    select * into v_call from public.calls
-    where caller_id = p_caller_id and client_call_id = v_clean_client_id
-    for update;
+    -- Loop to handle racing non-advisory insertions (e.g. from POST /calls)
+    loop
+      select * into v_call from public.calls
+      where caller_id = p_caller_id and client_call_id = v_clean_client_id
+      for update;
 
-    if found then
-      v_call_id := v_call.id;
-      if p_outcome is not null then
-        if v_call.outcome is not null and v_call.outcome <> p_outcome then
-          raise exception 'Conflict: Call % is already finalized with outcome %', v_call_id, v_call.outcome
-            using errcode = '23505';
+      if found then
+        v_call_id := v_call.id;
+        if p_outcome is not null then
+          if v_call.outcome is not null and v_call.outcome <> p_outcome then
+            raise exception 'Conflict: Call % is already finalized with outcome %', v_call_id, v_call.outcome
+              using errcode = '23505';
+          end if;
+          update public.calls
+          set outcome = p_outcome,
+              outcome_notes = coalesce(p_outcome_notes, outcome_notes),
+              ended_at = coalesce(p_ended_at, ended_at, pg_catalog.now()),
+              current_stage_id = coalesce(p_current_stage_id, current_stage_id)
+          where id = v_call_id;
         end if;
-        update public.calls
-        set outcome = p_outcome,
-            outcome_notes = coalesce(p_outcome_notes, outcome_notes),
-            ended_at = coalesce(p_ended_at, ended_at, pg_catalog.now()),
-            current_stage_id = coalesce(p_current_stage_id, current_stage_id)
-        where id = v_call_id;
+        exit;
+      else
+        begin
+          insert into public.calls (
+            caller_id, client_call_id, prospect_name, company_name,
+            current_stage_id, started_at, ended_at, outcome, outcome_notes
+          ) values (
+            p_caller_id, v_clean_client_id, p_prospect_name, p_company_name,
+            p_current_stage_id, coalesce(p_started_at, pg_catalog.now()), p_ended_at, p_outcome, p_outcome_notes
+          ) returning id into v_call_id;
+          exit;
+        exception when unique_violation then
+          -- A competing insert committed. Loop back, acquire row lock with FOR UPDATE,
+          -- and enforce the outcome-conflict check atomically.
+        end;
       end if;
-    else
-      -- Insert new call with unique-conflict protection
-      insert into public.calls (
-        caller_id, client_call_id, prospect_name, company_name,
-        current_stage_id, started_at, ended_at, outcome, outcome_notes
-      ) values (
-        p_caller_id, v_clean_client_id, p_prospect_name, p_company_name,
-        p_current_stage_id, coalesce(p_started_at, pg_catalog.now()), p_ended_at, p_outcome, p_outcome_notes
-      )
-      on conflict (caller_id, client_call_id) where client_call_id is not null
-      do update set
-        outcome = coalesce(excluded.outcome, public.calls.outcome),
-        outcome_notes = coalesce(excluded.outcome_notes, public.calls.outcome_notes),
-        ended_at = coalesce(excluded.ended_at, public.calls.ended_at),
-        current_stage_id = coalesce(excluded.current_stage_id, public.calls.current_stage_id)
-      returning id into v_call_id;
-    end if;
+    end loop;
   else
     -- Deliberate null client_call_id path: creates an unkeyed call record
     insert into public.calls (

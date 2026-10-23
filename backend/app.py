@@ -376,13 +376,15 @@ def list_stages() -> list[dict[str, Any]]:
 def start_call(payload: StartCall, caller: Caller = Depends(get_current_caller)) -> dict[str, Any]:
     """Creates a new persistent call stamped with the authenticated caller's identity."""
     d = db()
+    clean_client_id = payload.client_call_id.strip() if payload.client_call_id and payload.client_call_id.strip() else None
+
     # Idempotency check if client_call_id is provided
-    if payload.client_call_id:
+    if clean_client_id:
         existing = (
             d.table("calls")
             .select("*")
             .eq("caller_id", caller.id)
-            .eq("client_call_id", payload.client_call_id)
+            .eq("client_call_id", clean_client_id)
             .maybe_single()
             .execute()
             .data
@@ -394,17 +396,35 @@ def start_call(payload: StartCall, caller: Caller = Depends(get_current_caller))
     first_stage_id = stages[0]["id"] if stages else "opening"
     row: dict[str, Any] = {
         "caller_id": caller.id,
-        "client_call_id": payload.client_call_id,
+        "client_call_id": clean_client_id,
         "prospect_name": payload.prospect_name,
         "company_name": payload.company_name,
         "current_stage_id": first_stage_id,
     }
     if payload.started_at:
         row["started_at"] = payload.started_at.isoformat()
-    response = d.table("calls").insert(row).execute()
-    if not response.data:
-        raise HTTPException(500, "Could not create call")
-    return response.data[0]
+
+    try:
+        response = d.table("calls").insert(row).execute()
+        if not response.data:
+            raise HTTPException(500, "Could not create call")
+        return response.data[0]
+    except Exception as exc:
+        err_msg = str(exc)
+        # Safely handle concurrent race on unique index (caller_id, client_call_id)
+        if clean_client_id and ("calls_client_call_id_idx" in err_msg or "23505" in err_msg or "duplicate key" in err_msg.lower()):
+            existing = (
+                d.table("calls")
+                .select("*")
+                .eq("caller_id", caller.id)
+                .eq("client_call_id", clean_client_id)
+                .maybe_single()
+                .execute()
+                .data
+            )
+            if existing:
+                return existing[0] if isinstance(existing, list) else existing
+        raise HTTPException(500, f"Could not create call: {exc}")
 
 
 @app.post("/calls/{call_id}/stage-results")

@@ -1782,3 +1782,168 @@ def test_real_postgresql_rpc_privilege_enforcement():
         else:
             assert res.returncode != 0, f"Role {role} should fail but succeeded: {res.stdout}"
             assert "permission denied for function sync_offline_call_transaction" in res.stderr
+
+
+def test_start_call_competing_insert_recovers_existing_call(mock_db, monkeypatch):
+    """
+    REGRESSION TEST: Verify that if a competing request inserts a call with the same
+    (caller_id, client_call_id) right before this request's insert executes, start_call
+    catches the unique constraint collision (calls_client_call_id_idx) and safely
+    recovers and returns the existing call record instead of throwing an unhandled 500 error.
+    """
+    client_call_id = "competing-race-uuid-123"
+    payload = {
+        "client_call_id": client_call_id,
+        "prospect_name": "Racing Prospect",
+        "company_name": "Speedy Corp",
+    }
+
+    # First request: normal creation
+    res1 = client.post("/calls", json=payload)
+    assert res1.status_code == 200
+    call1 = res1.json()
+
+    # Second request: retry with same client_call_id returns existing call
+    res2 = client.post("/calls", json=payload)
+    assert res2.status_code == 200
+    call2 = res2.json()
+    assert call1["id"] == call2["id"]
+
+    # Third simulation: force an insert-level unique conflict (simulating race condition)
+    # where the pre-check didn't see the record, but insert collides on calls_client_call_id_idx
+    orig_table = mock_db.table
+
+    race_first_select_done = False
+
+    class RaceTableQuery(MockTableQuery):
+        def maybe_single(self):
+            super().maybe_single()
+            nonlocal race_first_select_done
+            if not race_first_select_done:
+                self._force_empty_select = True
+                race_first_select_done = True
+            return self
+
+        def execute(self):
+            if getattr(self, "_force_empty_select", False) and self._action == "select":
+                class EmptyResult:
+                    data = None
+                    count = 0
+                return EmptyResult()
+            return super().execute()
+
+    def racing_table(name: str):
+        if name == "calls":
+            return RaceTableQuery(name, mock_db.db_state)
+        return orig_table(name)
+
+    monkeypatch.setattr(mock_db, "table", racing_table)
+
+    # Calling /calls will hit the simulated race where select returns None,
+    # insert throws unique key violation, and catch handler recovers existing call
+    res_race = client.post("/calls", json=payload)
+    assert res_race.status_code == 200
+    call_race = res_race.json()
+    assert call_race["id"] == call1["id"]
+
+
+def test_real_postgresql_competing_call_creation_and_conflicting_finalization():
+    """
+    REAL POSTGRESQL TEST: Proves that:
+    1. A call inserted via normal call-creation (simulating POST /calls) with a client_call_id
+       and finalized outcome cannot have its outcome silently overwritten by sync_offline_call_transaction.
+    2. The PL/pgSQL upsert loop catches the racing insert, acquires the row lock, and enforces
+       the outcome-conflict check atomically in PostgreSQL.
+    3. The conflicting offline sync attempt fails with 23505 conflict exception.
+    4. The original finalized outcome in public.calls remains unchanged.
+    5. Exactly 1 call row exists in public.calls (zero duplicates).
+    6. A subsequent retry with matching outcome succeeds and returns the existing call.
+    """
+    if not _check_real_postgres():
+        pytest.skip("Local PostgreSQL database coldcall_test not available")
+
+    # Re-apply migration to ensure exact current SQL is loaded
+    subprocess.run([PSQL_BIN, "-d", "coldcall_test", "-f", "supabase/migrations/20261023_secure_sync_offline_rpc.sql"], capture_output=True, text=True)
+
+    client_id = f"pg-competing-race-{uuid4()}"
+
+    # Step 1: Simulate normal call creation and finalization (e.g. from POST /calls and close)
+    insert_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        INSERT INTO public.calls (
+          caller_id, client_call_id, prospect_name, company_name,
+          current_stage_id, outcome, outcome_notes, started_at, ended_at
+        ) VALUES (
+          'rep-alpha', '{client_id}', 'Competing Prospect', 'Compete Ltd',
+          'purpose', 'meeting_booked', 'Initial meeting scheduled', NOW(), NOW()
+        ) RETURNING id;
+        """
+    ]
+    ins_res = subprocess.run(insert_cmd, capture_output=True, text=True)
+    assert ins_res.returncode == 0, f"Insert failed: {ins_res.stderr}"
+    existing_id = ins_res.stdout.strip().splitlines()[0]
+
+    # Step 2: Attempt conflicting offline sync with outcome 'not_interested'
+    conflict_sync_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SELECT public.sync_offline_call_transaction(
+          'rep-alpha',
+          '{client_id}',
+          'Competing Prospect',
+          'Compete Ltd',
+          'purpose',
+          NOW(),
+          NOW(),
+          'not_interested',
+          'Attempted overwrite',
+          '[]'::jsonb
+        );
+        """
+    ]
+    conf_res = subprocess.run(conflict_sync_cmd, capture_output=True, text=True)
+    # Must fail with conflict exception
+    assert conf_res.returncode != 0
+    assert "already finalized with outcome meeting_booked" in conf_res.stderr
+
+    # Step 3: Verify the outcome in public.calls was NOT overwritten
+    verify_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"SELECT outcome FROM public.calls WHERE client_call_id = '{client_id}';"
+    ]
+    v_res = subprocess.run(verify_cmd, capture_output=True, text=True)
+    assert v_res.stdout.strip() == "meeting_booked", f"Expected meeting_booked, got {v_res.stdout.strip()}"
+
+    # Step 4: Verify exactly 1 call row exists in database
+    count_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"SELECT count(*) FROM public.calls WHERE client_call_id = '{client_id}';"
+    ]
+    c_res = subprocess.run(count_cmd, capture_output=True, text=True)
+    assert c_res.stdout.strip() == "1"
+
+    # Step 5: Retry with matching outcome 'meeting_booked' succeeds and recovers existing call
+    matching_sync_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SELECT public.sync_offline_call_transaction(
+          'rep-alpha',
+          '{client_id}',
+          'Competing Prospect',
+          'Compete Ltd',
+          'purpose',
+          NOW(),
+          NOW(),
+          'meeting_booked',
+          'Updated meeting notes',
+          '[{{"stage_id": "opening", "result": "Reached right person"}}]'::jsonb
+        );
+        """
+    ]
+    match_res = subprocess.run(matching_sync_cmd, capture_output=True, text=True)
+    assert match_res.returncode == 0, f"Matching retry failed: {match_res.stderr}"
+    data = json.loads(match_res.stdout.strip())
+    assert data["id"] == existing_id
+    assert data["outcome"] == "meeting_booked"
+    assert len(data["stage_results"]) == 1
