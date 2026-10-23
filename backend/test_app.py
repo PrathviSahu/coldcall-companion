@@ -228,12 +228,13 @@ class MockSupabaseClient:
                         scratch_stages = [dict(s) for s in self.client.db_state["call_stage_results"]]
 
                         caller_id = self.params.get("p_caller_id")
-                        client_call_id = self.params.get("p_client_call_id")
+                        raw_client_id = self.params.get("p_client_call_id")
+                        clean_client_id = str(raw_client_id).strip() if raw_client_id and str(raw_client_id).strip() else None
 
                         existing_call = None
-                        if client_call_id:
+                        if clean_client_id:
                             for c in scratch_calls:
-                                if c.get("caller_id") == caller_id and c.get("client_call_id") == client_call_id:
+                                if c.get("caller_id") == caller_id and c.get("client_call_id") == clean_client_id:
                                     existing_call = c
                                     break
 
@@ -252,7 +253,7 @@ class MockSupabaseClient:
                             target_call = {
                                 "id": call_id,
                                 "caller_id": caller_id,
-                                "client_call_id": client_call_id,
+                                "client_call_id": clean_client_id,
                                 "prospect_name": self.params.get("p_prospect_name"),
                                 "company_name": self.params.get("p_company_name"),
                                 "current_stage_id": self.params.get("p_current_stage_id"),
@@ -1370,6 +1371,8 @@ def test_rpc_permissions_and_empty_search_path_in_schema():
         migration_sql = f.read()
 
     for content, filename in [(schema_sql, "schema.sql"), (migration_sql, "migration.sql")]:
+        assert "pg_catalog.coalesce" not in content, f"Invalid pg_catalog.coalesce syntax in {filename}"
+        assert "pg_catalog.trim" not in content, f"Invalid pg_catalog.trim syntax in {filename}"
         assert "set search_path = ''" in content, f"Missing set search_path = '' in {filename}"
         assert "revoke all on function public.sync_offline_call_transaction" in content, f"Missing revoke in {filename}"
         assert "from public" in content, f"Missing revoke from public in {filename}"
@@ -1471,3 +1474,311 @@ def test_sync_offline_call_derives_caller_from_authenticated_token(mock_db):
     client_b.headers.update({"Authorization": f"Bearer {VALID_CALLER_B_TOKEN}"})
     get_res = client_b.get(f"/calls/{call_data['id']}")
     assert get_res.status_code == 403
+
+
+def test_sync_offline_call_missing_client_call_id(mock_db):
+    """
+    REGRESSION TEST: Verify that missing client_call_id in sync request executes
+    safely via the deliberate null-ID path without uninitialized record errors.
+    """
+    payload = {
+        "prospect_name": "No Client ID Prospect",
+        "company_name": "Unkeyed Corp",
+        "stage_results": [
+            {"stage_id": "opening", "result": "Reached right person"},
+        ],
+    }
+    res = client.post("/calls/sync-offline", json=payload)
+    assert res.status_code == 200, res.text
+    call_data = res.json()
+    assert call_data["id"] is not None
+    assert call_data["client_call_id"] is None
+    assert call_data["prospect_name"] == "No Client ID Prospect"
+
+
+def test_sync_offline_call_whitespace_client_call_id(mock_db):
+    """
+    REGRESSION TEST: Verify that whitespace-only client_call_id is normalized
+    to None and safely handled via deliberate null-ID path.
+    """
+    payload = {
+        "client_call_id": "   ",
+        "prospect_name": "Whitespace Client ID Prospect",
+        "company_name": "Spaces Ltd",
+        "stage_results": [
+            {"stage_id": "opening", "result": "Reached right person"},
+        ],
+    }
+    res = client.post("/calls/sync-offline", json=payload)
+    assert res.status_code == 200, res.text
+    call_data = res.json()
+    assert call_data["client_call_id"] is None
+
+
+# -----------------------------------------------------------------------------
+# REAL POSTGRESQL INTEGRATION TESTS (Verified Against Local PostgreSQL Instance)
+# -----------------------------------------------------------------------------
+import shutil
+import subprocess
+
+PSQL_BIN = shutil.which("psql") or "/opt/homebrew/opt/postgresql@16/bin/psql"
+
+
+def _check_real_postgres():
+    if not os.path.exists(PSQL_BIN) and not shutil.which("psql"):
+        return False
+    try:
+        r = subprocess.run([PSQL_BIN, "-d", "coldcall_test", "-c", "SELECT 1;"], capture_output=True, text=True, timeout=2)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def test_real_postgresql_rpc_syntax_and_execution():
+    """
+    REAL POSTGRESQL TEST: Applies migration to coldcall_test database and executes
+    public.sync_offline_call_transaction directly in PostgreSQL, proving:
+    1. Valid COALESCE(...) and TRIM(...) syntax executes without pg_catalog function-resolution errors.
+    2. Empty search_path executes and returns valid JSONB.
+    """
+    if not _check_real_postgres():
+        pytest.skip("Local PostgreSQL database coldcall_test not available")
+
+    # Re-apply migration to ensure exact current SQL is loaded
+    apply_res = subprocess.run([PSQL_BIN, "-d", "coldcall_test", "-f", "supabase/migrations/20261023_secure_sync_offline_rpc.sql"], capture_output=True, text=True)
+    assert apply_res.returncode == 0, f"Migration failed: {apply_res.stderr}"
+
+    # Execute function
+    run_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        """
+        SELECT public.sync_offline_call_transaction(
+          'rep-alpha',
+          'real-pg-test-001',
+          'Postgres Prospect',
+          'Postgres Corp',
+          'opening',
+          NOW(),
+          NULL,
+          NULL,
+          NULL,
+          '[{"stage_id": "opening", "result": "Reached right person"}]'::jsonb
+        );
+        """
+    ]
+    exec_res = subprocess.run(run_cmd, capture_output=True, text=True)
+    assert exec_res.returncode == 0, f"Execution failed: {exec_res.stderr}"
+    data = json.loads(exec_res.stdout.strip())
+    assert data["client_call_id"] == "real-pg-test-001"
+    assert data["caller_id"] == "rep-alpha"
+    assert len(data["stage_results"]) == 1
+
+
+def test_real_postgresql_concurrent_sync_same_client_id():
+    """
+    REAL POSTGRESQL TEST: Spawns 5 concurrent OS processes running psql transactions
+    with the exact same (caller_id, client_call_id).
+    Proves that pg_advisory_xact_lock and ON CONFLICT serialize concurrent requests,
+    all succeed without 23505 unique constraint errors, all return identical call ID,
+    and exactly 1 call row is written to public.calls.
+    """
+    if not _check_real_postgres():
+        pytest.skip("Local PostgreSQL database coldcall_test not available")
+
+    race_client_id = f"pg-concurrency-test-{uuid4()}"
+
+    def run_worker(idx):
+        cmd = [
+            PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+            f"""
+            SELECT public.sync_offline_call_transaction(
+              'rep-alpha',
+              '{race_client_id}',
+              'Race Prospect {idx}',
+              'Race Corp',
+              'opening',
+              NOW(),
+              NULL,
+              NULL,
+              NULL,
+              '[{{"stage_id": "opening", "result": "Reached right person"}}]'::jsonb
+            );
+            """
+        ]
+        return subprocess.run(cmd, capture_output=True, text=True)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(run_worker, i) for i in range(5)]
+        results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+    # All must succeed
+    assert all(r.returncode == 0 for r in results), f"Errors: {[r.stderr for r in results if r.returncode != 0]}"
+    call_ids = {json.loads(r.stdout.strip())["id"] for r in results}
+    assert len(call_ids) == 1, f"Expected 1 unique call ID across concurrent workers, got: {call_ids}"
+
+    # Database must contain exactly 1 row
+    count_cmd = [PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c", f"SELECT count(*) FROM public.calls WHERE client_call_id = '{race_client_id}';"]
+    count_res = subprocess.run(count_cmd, capture_output=True, text=True)
+    assert count_res.stdout.strip() == "1"
+
+
+def test_real_postgresql_missing_and_whitespace_client_id():
+    """
+    REAL POSTGRESQL TEST: Tests deliberate null client_call_id and whitespace client_call_id
+    against real PostgreSQL, verifying no 'record v_call is not assigned yet' errors occur.
+    """
+    if not _check_real_postgres():
+        pytest.skip("Local PostgreSQL database coldcall_test not available")
+
+    for test_id_val in ["NULL", "'   '"]:
+        cmd = [
+            PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+            f"""
+            SELECT public.sync_offline_call_transaction(
+              'rep-alpha',
+              {test_id_val},
+              'Null Client Prospect',
+              'Null Corp',
+              'opening',
+              NOW(),
+              NULL,
+              NULL,
+              NULL,
+              '[]'::jsonb
+            );
+            """
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        assert res.returncode == 0, f"Execution failed for {test_id_val}: {res.stderr}"
+        data = json.loads(res.stdout.strip())
+        assert data["client_call_id"] is None
+
+
+def test_real_postgresql_outcome_conflict_on_finalized_call():
+    """
+    REAL POSTGRESQL TEST: Finalizes a call with 'meeting_booked' and retries with
+    'not_interested', verifying real PostgreSQL raises 23505 conflict exception.
+    """
+    if not _check_real_postgres():
+        pytest.skip("Local PostgreSQL database coldcall_test not available")
+
+    client_id = f"pg-conflict-test-{uuid4()}"
+    # 1. Finalize call
+    cmd1 = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SELECT public.sync_offline_call_transaction(
+          'rep-alpha',
+          '{client_id}',
+          'Finalized Prospect',
+          'Final Corp',
+          'permission',
+          NOW(),
+          NOW(),
+          'meeting_booked',
+          'Meeting scheduled',
+          '[]'::jsonb
+        );
+        """
+    ]
+    r1 = subprocess.run(cmd1, capture_output=True, text=True)
+    assert r1.returncode == 0
+
+    # 2. Conflicting outcome retry
+    cmd2 = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SELECT public.sync_offline_call_transaction(
+          'rep-alpha',
+          '{client_id}',
+          'Finalized Prospect',
+          'Final Corp',
+          'permission',
+          NOW(),
+          NOW(),
+          'not_interested',
+          'Changed outcome',
+          '[]'::jsonb
+        );
+        """
+    ]
+    r2 = subprocess.run(cmd2, capture_output=True, text=True)
+    assert r2.returncode != 0
+    assert "already finalized with outcome meeting_booked" in r2.stderr
+
+
+def test_real_postgresql_mid_transaction_rollback():
+    """
+    REAL POSTGRESQL TEST: Verifies that a crash during stage write causes PostgreSQL
+    to roll back the entire transaction, leaving zero call rows and zero stage rows.
+    """
+    if not _check_real_postgres():
+        pytest.skip("Local PostgreSQL database coldcall_test not available")
+
+    rollback_client_id = f"pg-rollback-{uuid4()}"
+    cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        DO $$
+        BEGIN
+          BEGIN
+            PERFORM public.sync_offline_call_transaction(
+              'rep-alpha',
+              '{rollback_client_id}',
+              'Crash Prospect',
+              'Crash Corp',
+              'opening',
+              NOW(),
+              NULL,
+              NULL,
+              NULL,
+              '[{{"stage_id": "opening", "result": "ok"}}, {{"invalid_schema": 123}}]'::jsonb
+            );
+          EXCEPTION WHEN OTHERS THEN
+            NULL; -- Expected exception
+          END;
+        END $$;
+        """
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    assert r.returncode == 0
+
+    # Verify zero calls exist in database for this client ID
+    count_cmd = [PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c", f"SELECT count(*) FROM public.calls WHERE client_call_id = '{rollback_client_id}';"]
+    count_res = subprocess.run(count_cmd, capture_output=True, text=True)
+    assert count_res.stdout.strip() == "0"
+
+
+def test_real_postgresql_rpc_privilege_enforcement():
+    """
+    REAL POSTGRESQL TEST: Verifies that anon and authenticated roles are denied execute
+    on public.sync_offline_call_transaction, while service_role is granted execute.
+    """
+    if not _check_real_postgres():
+        pytest.skip("Local PostgreSQL database coldcall_test not available")
+
+    for role, should_succeed in [("anon", False), ("authenticated", False), ("service_role", True)]:
+        cmd = [
+            PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+            f"""
+            SET ROLE {role};
+            SELECT public.sync_offline_call_transaction(
+              'rep-alpha',
+              'perm-test-{role}',
+              'Perm Prospect',
+              'Perm Corp',
+              'opening',
+              NOW(),
+              NULL,
+              NULL,
+              NULL,
+              '[]'::jsonb
+            );
+            """
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if should_succeed:
+            assert res.returncode == 0, f"Role {role} should succeed but failed: {res.stderr}"
+        else:
+            assert res.returncode != 0, f"Role {role} should fail but succeeded: {res.stdout}"
+            assert "permission denied for function sync_offline_call_transaction" in res.stderr

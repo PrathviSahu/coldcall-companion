@@ -242,46 +242,72 @@ declare
   v_words pg_catalog.text;
   v_notes pg_catalog.text;
   v_result_json pg_catalog.jsonb;
+  v_clean_client_id pg_catalog.text;
 begin
-  -- 1. Idempotency check: if client_call_id already exists for this caller, reuse it
-  if p_client_call_id is not null then
-    select * into v_call from public.calls
-    where caller_id = p_caller_id and client_call_id = p_client_call_id;
+  -- Normalize client_call_id: nullify empty or whitespace strings
+  v_clean_client_id := null;
+  if p_client_call_id is not null and trim(p_client_call_id) <> '' then
+    v_clean_client_id := trim(p_client_call_id);
   end if;
 
-  if v_call.id is not null then
-    v_call_id := v_call.id;
-    -- Update outcome if provided and not finalized with conflicting outcome
-    if p_outcome is not null then
-      if v_call.outcome is not null and v_call.outcome <> p_outcome then
-        raise exception 'Conflict: Call % is already finalized with outcome %', v_call_id, v_call.outcome
-          using errcode = '23505';
+  -- 1. Idempotency & Concurrency: If client_call_id is present, serialize and look up
+  if v_clean_client_id is not null then
+    -- Transaction-level advisory lock serializes concurrent syncs with the exact same caller & client_call_id
+    perform pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext(p_caller_id || ':' || v_clean_client_id));
+
+    select * into v_call from public.calls
+    where caller_id = p_caller_id and client_call_id = v_clean_client_id
+    for update;
+
+    if found then
+      v_call_id := v_call.id;
+      if p_outcome is not null then
+        if v_call.outcome is not null and v_call.outcome <> p_outcome then
+          raise exception 'Conflict: Call % is already finalized with outcome %', v_call_id, v_call.outcome
+            using errcode = '23505';
+        end if;
+        update public.calls
+        set outcome = p_outcome,
+            outcome_notes = coalesce(p_outcome_notes, outcome_notes),
+            ended_at = coalesce(p_ended_at, ended_at, pg_catalog.now()),
+            current_stage_id = coalesce(p_current_stage_id, current_stage_id)
+        where id = v_call_id;
       end if;
-      update public.calls
-      set outcome = p_outcome,
-          outcome_notes = pg_catalog.coalesce(p_outcome_notes, outcome_notes),
-          ended_at = pg_catalog.coalesce(p_ended_at, ended_at, pg_catalog.now()),
-          current_stage_id = pg_catalog.coalesce(p_current_stage_id, current_stage_id)
-      where id = v_call_id;
+    else
+      -- Insert new call with unique-conflict protection
+      insert into public.calls (
+        caller_id, client_call_id, prospect_name, company_name,
+        current_stage_id, started_at, ended_at, outcome, outcome_notes
+      ) values (
+        p_caller_id, v_clean_client_id, p_prospect_name, p_company_name,
+        p_current_stage_id, coalesce(p_started_at, pg_catalog.now()), p_ended_at, p_outcome, p_outcome_notes
+      )
+      on conflict (caller_id, client_call_id) where client_call_id is not null
+      do update set
+        outcome = coalesce(excluded.outcome, public.calls.outcome),
+        outcome_notes = coalesce(excluded.outcome_notes, public.calls.outcome_notes),
+        ended_at = coalesce(excluded.ended_at, public.calls.ended_at),
+        current_stage_id = coalesce(excluded.current_stage_id, public.calls.current_stage_id)
+      returning id into v_call_id;
     end if;
   else
-    -- 2. Insert new call atomically
+    -- Deliberate null client_call_id path: creates an unkeyed call record
     insert into public.calls (
       caller_id, client_call_id, prospect_name, company_name,
       current_stage_id, started_at, ended_at, outcome, outcome_notes
     ) values (
-      p_caller_id, p_client_call_id, p_prospect_name, p_company_name,
-      p_current_stage_id, pg_catalog.coalesce(p_started_at, pg_catalog.now()), p_ended_at, p_outcome, p_outcome_notes
+      p_caller_id, null, p_prospect_name, p_company_name,
+      p_current_stage_id, coalesce(p_started_at, pg_catalog.now()), p_ended_at, p_outcome, p_outcome_notes
     ) returning id into v_call_id;
   end if;
 
-  -- 3. Insert / upsert all stage results within the same transaction
+  -- 2. Insert / upsert all stage results within the same transaction
   if p_stage_results is not null and pg_catalog.jsonb_array_length(p_stage_results) > 0 then
     for v_sr in select * from pg_catalog.jsonb_array_elements(p_stage_results) loop
       v_stage_id := v_sr->>'stage_id';
-      v_result := pg_catalog.coalesce(v_sr->>'result', 'completed');
-      v_words := pg_catalog.coalesce(v_sr->>'prospect_words', '');
-      v_notes := pg_catalog.coalesce(v_sr->>'notes', '');
+      v_result := coalesce(v_sr->>'result', 'completed');
+      v_words := coalesce(v_sr->>'prospect_words', '');
+      v_notes := coalesce(v_sr->>'notes', '');
 
       insert into public.call_stage_results (call_id, stage_id, result, prospect_words, notes, updated_at)
       values (v_call_id, v_stage_id, v_result, v_words, v_notes, pg_catalog.now())
@@ -293,7 +319,7 @@ begin
     end loop;
   end if;
 
-  -- 4. Construct and return full call object including stage_results
+  -- 3. Construct and return full call object including stage_results
   select pg_catalog.jsonb_build_object(
     'id', c.id,
     'caller_id', c.caller_id,
@@ -306,9 +332,9 @@ begin
     'outcome', c.outcome,
     'outcome_notes', c.outcome_notes,
     'created_at', c.created_at,
-    'stage_results', pg_catalog.coalesce(
+    'stage_results', coalesce(
       (select pg_catalog.jsonb_agg(pg_catalog.to_jsonb(csr)) from public.call_stage_results csr where csr.call_id = c.id),
-      '[]'::jsonb
+      '[]'::pg_catalog.jsonb
     )
   ) into v_result_json
   from public.calls c where c.id = v_call_id;

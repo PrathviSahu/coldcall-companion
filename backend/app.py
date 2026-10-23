@@ -565,31 +565,18 @@ def sync_offline_call(
     started_at_str = payload.started_at.isoformat() if payload.started_at else datetime.now(timezone.utc).isoformat()
     ended_at_str = payload.ended_at.isoformat() if payload.ended_at else None
 
-    # 5. Idempotency Check: if client_call_id already exists for this caller, recover it
-    if payload.client_call_id:
-        existing = (
-            d.table("calls")
-            .select("*")
-            .eq("caller_id", caller.id)
-            .eq("client_call_id", payload.client_call_id)
-            .maybe_single()
-            .execute()
-            .data
-        )
-        if existing:
-            # Check for conflict with previously finalized outcome
-            if existing.get("ended_at") and payload.outcome and existing.get("outcome") != payload.outcome:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Call is already closed with conflicting outcome '{existing.get('outcome')}'"
-                )
+    # 5. Normalize client_call_id: strip whitespace, handle deliberate null ID
+    clean_client_id = payload.client_call_id.strip() if payload.client_call_id and payload.client_call_id.strip() else None
 
     # 6. Execute PostgreSQL Transactional RPC (Sole atomic persistence path)
+    # The RPC atomically enforces pg_advisory_xact_lock on (caller_id, client_call_id),
+    # detects outcome conflicts on finalized calls, and uses ON CONFLICT DO UPDATE
+    # to eliminate concurrent insertion race conditions in PostgreSQL.
     stages_json = [sr.model_dump() for sr in payload.stage_results]
     try:
         rpc_call = d.rpc("sync_offline_call_transaction", {
             "p_caller_id": caller.id,
-            "p_client_call_id": payload.client_call_id,
+            "p_client_call_id": clean_client_id,
             "p_prospect_name": payload.prospect_name,
             "p_company_name": payload.company_name,
             "p_current_stage_id": current_stage,
