@@ -1855,3 +1855,67 @@ button:disabled {
     padding: 22px 16px;
   }
 }
+
+/* Additional Navigation & History States */
+.nav-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.end-call-secondary {
+  color: #798074;
+  font-size: 11px;
+}
+
+.end-call-secondary:hover {
+  color: #9c4533;
+  background: #fdf0ec;
+}
+
+.loading-history,
+.error-history {
+  min-height: 240px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 30px;
+  color: #7a8074;
+}
+
+.loading-history p {
+  font-size: 11px;
+  margin-top: 10px;
+  color: #8c9186;
+}
+
+.spin-icon {
+  animation: spin 1s linear infinite;
+  color: #4a7056;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.error-history svg {
+  color: #c75641;
+  margin-bottom: 12px;
+}
+
+.error-history h3 {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0 0 6px;
+  color: #272d24;
+}
+
+.error-history p {
+  font-size: 11px;
+  margin: 0 0 16px;
+  max-width: 320px;
+  line-height: 1.5;
+}

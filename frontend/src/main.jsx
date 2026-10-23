@@ -245,6 +245,8 @@ function App() {
 
   // History & detail state
   const [history, setHistory] = useState([]);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+  const [historyError, setHistoryError] = useState('');
   const [search, setSearch] = useState('');
   const [outcome, setOutcome] = useState('meeting_booked');
   const [outcomeNotes, setOutcomeNotes] = useState('');
@@ -297,6 +299,8 @@ function App() {
 
   // Load and merge history from server and localStorage without duplicates
   async function loadHistory() {
+    setLoadingHistory(true);
+    setHistoryError('');
     const raw = localStorage.getItem('sidecall-history');
     let localCalls = [];
     try {
@@ -330,12 +334,17 @@ function App() {
         (a, b) => new Date(b.started_at || 0) - new Date(a.started_at || 0)
       );
       setHistory(sorted);
-    } catch {
-      // Backend offline: show local records clearly
-      const localOnly = localCalls.map(c => ({ ...c, isLocal: true })).sort(
-        (a, b) => new Date(b.started_at || 0) - new Date(a.started_at || 0)
-      );
-      setHistory(localOnly);
+    } catch (err) {
+      if (localCalls.length > 0) {
+        const localOnly = localCalls.map(c => ({ ...c, isLocal: true })).sort(
+          (a, b) => new Date(b.started_at || 0) - new Date(a.started_at || 0)
+        );
+        setHistory(localOnly);
+      } else {
+        setHistoryError(err.message || 'Could not reach backend server.');
+      }
+    } finally {
+      setLoadingHistory(false);
     }
   }
 
@@ -833,14 +842,24 @@ function App() {
 
                     {/* Stage Navigation Footer */}
                     <div className="stage-nav">
-                      <button
-                        className="quiet-button"
-                        type="button"
-                        disabled={activeIndex === 0 || savingStage}
-                        onClick={() => goToStage(activeIndex - 1)}
-                      >
-                        <ArrowLeft size={15} /> Previous
-                      </button>
+                      <div className="nav-left">
+                        <button
+                          className="quiet-button"
+                          type="button"
+                          disabled={activeIndex === 0 || savingStage}
+                          onClick={() => goToStage(activeIndex - 1)}
+                        >
+                          <ArrowLeft size={15} /> Previous
+                        </button>
+                        <button
+                          className="quiet-button end-call-secondary"
+                          type="button"
+                          onClick={() => setFinishOpen(true)}
+                          title="End conversation from this stage"
+                        >
+                          <X size={14} /> End call
+                        </button>
+                      </div>
 
                       <div className="nav-right">
                         <button
@@ -1210,7 +1229,21 @@ function App() {
                 <span />
               </div>
 
-              {visibleHistory.length === 0 ? (
+              {loadingHistory ? (
+                <div className="loading-history">
+                  <RefreshCw size={24} className="spin-icon" />
+                  <p>Loading call records from server and local storage…</p>
+                </div>
+              ) : historyError && visibleHistory.length === 0 ? (
+                <div className="error-history">
+                  <WifiOff size={24} />
+                  <h3>Unable to reach server database</h3>
+                  <p>{historyError}</p>
+                  <button className="secondary-button" type="button" onClick={loadHistory}>
+                    <RefreshCw size={14} /> Retry loading
+                  </button>
+                </div>
+              ) : visibleHistory.length === 0 ? (
                 <div className="empty-history">
                   <div className="empty-icon">
                     <History size={22} />

@@ -8,7 +8,7 @@ A focused, editorial live-call side screen for outbound callers reaching Indian 
 
 ## Live System & Architecture
 
-- **Frontend**: React + Vite (`DM Sans`, `DM Mono`, `Playfair Display`), responsive editorial layout.
+- **Frontend**: React + Vite (`DM Sans`, `DM Mono`, `Playfair Display`), responsive editorial layout with stage stepper, quick-tap cards, verbatim text area, and history audit table.
 - **Backend**: Python 3.13 + FastAPI (`/health`, `/stages`, `/calls`, `/calls/{id}/stage-results`, `/calls/{id}/close`, `/calls/{id}/ai-summary`).
 - **Persistence**: Supabase Postgres with row-level security and idempotent migrations (`supabase/schema.sql`).
 - **Local Fallback**: Full offline resilience via `localStorage` with honest `Offline / Local` labeling (never pretends to be synced).
@@ -51,7 +51,14 @@ Derived directly from the DeepThought cold-call structure guidelines and empiric
 ## Local Development & Setup
 
 ### 1. Database (Supabase)
-Run `supabase/schema.sql` in the Supabase SQL Editor. This idempotently creates tables (`call_stages`, `calls`, `call_stage_results`), indexes, and seeds the 8 stages with prospect patterns and quick taps.
+1. In your Supabase dashboard, open the **SQL Editor**.
+2. Paste and run the entire contents of `supabase/schema.sql`.
+3. This creates:
+   - `public.call_stages` (and seeds all 8 stages with prospect patterns and quick taps)
+   - `public.calls` (with outcome constraints, stage tracking, and AI debrief column)
+   - `public.call_stage_results` (with composite unique key on `call_id, stage_id`)
+   - Indexes and Row Level Security policies.
+   The script is fully idempotent (`ON CONFLICT (id) DO UPDATE`).
 
 ### 2. Backend (FastAPI)
 ```bash
@@ -98,14 +105,54 @@ CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
 
 ---
 
+## Deployment Steps
+
+### 1. Backend Deployment (Render)
+1. In Render Dashboard, click **New Web Service** and connect the repository (`PrathviSahu/coldcall-companion`).
+2. Set **Root Directory** to `backend`.
+3. Set **Runtime** to `Python 3`.
+4. Set **Build Command**: `pip install -r requirements.txt`.
+5. Set **Start Command**: `uvicorn app:app --host 0.0.0.0 --port $PORT`.
+6. Add Environment Variables:
+   - `SUPABASE_URL`: Your Supabase project URL (`https://your-id.supabase.co`)
+   - `SUPABASE_SERVICE_ROLE_KEY`: Your server-only service-role key
+   - `LLM_API_KEY`: Your LLM provider API key
+   - `LLM_MODEL`: e.g. `gpt-4o-mini`
+   - `CORS_ORIGINS`: Your Vercel frontend URL (or `*` during initial staging)
+7. Deploy and verify health via `GET /health`.
+
+### 2. Frontend Deployment (Vercel)
+1. In Vercel Dashboard, click **Add New Project** and select `PrathviSahu/coldcall-companion`.
+2. Set **Root Directory** to `frontend`.
+3. Framework Preset: **Vite**.
+4. Configure Environment Variable:
+   - `VITE_API_BASE_URL`: Live Render backend URL from step 1 (e.g. `https://your-backend.onrender.com`).
+5. Deploy and verify live calling flow and history screen.
+
+---
+
 ## Endpoints
 
-- `GET /health`: Health and service connectivity status.
+- `GET /health`: Health and service connectivity status (`ok` / `degraded`, database state, LLM state).
 - `GET /stages`: Returns the 8 ordered stages with prospect patterns and stage taps.
-- `POST /calls`: Create a new call.
+- `POST /calls`: Create a new call with optional prospect/company names.
 - `POST /calls/{id}/stage-results`: Upsert stage outcome, verbatim words, and caller notes.
 - `PATCH /calls/{id}/stage`: Update active stage position.
-- `POST /calls/{id}/close`: Conclude call with terminal outcome and context notes.
-- `GET /calls`: List calls with stage outcomes and timestamps.
-- `GET /calls/{id}`: Detailed call record.
-- `POST /calls/{id}/ai-summary`: Generate post-call coaching debrief.
+- `POST /calls/{id}/close`: Conclude call with terminal outcome and next-step context notes.
+- `GET /calls`: List calls with stage outcomes and timestamps (paginated).
+- `GET /calls/{id}`: Detailed call record with all stage-by-stage notes.
+- `POST /calls/{id}/ai-summary`: Generate post-call coaching debrief from caller notes.
+
+---
+
+## Six-Minute Video Demo Outline (Applicant-Recorded)
+
+The demo must be recorded on camera by the applicant (no synthesized avatars) and shared via Google Drive with public viewer access:
+
+- **0:00–0:35 — Introduce the Problem**: Show yourself and the app. Explain why cold callers need a calm, single-screen guide rather than complex dashboards.
+- **0:35–1:15 — Start a Conversation**: Begin a call with an optional prospect name. Explain rapid entry.
+- **1:15–2:20 — Walk Through the Eight Stages**: Demonstrate stage purpose and empirical "What you may hear" cues derived from the 100 transcripts.
+- **2:20–3:25 — Capture the Conversation**: Tap a single-click outcome, type verbatim prospect words in Stage 5, and demonstrate atomic stage switching.
+- **3:25–4:10 — Wrap-Up & History Audit**: Close the call with a true outcome. Review the call history screen, showing the stage reached and outcome badge.
+- **4:10–5:15 — Defend an Engineering Decision**: Explain atomic stage persistence (eliminating async races) and honest offline fallback.
+- **5:15–6:00 — Architecture & Closing**: Show the stack (FastAPI, React + Vite, Supabase, server-side LLM debrief), `/health` endpoint, and what you would iterate next.
