@@ -218,6 +218,12 @@ class MockSupabaseClient:
                 if getattr(self.client, "_simulate_missing_rpc", False):
                     raise Exception("function sync_offline_call_transaction does not exist")
 
+                if getattr(self.client, "_simulate_missing_close_rpc", None) and self.fn == "close_call_transaction":
+                    raise Exception(self.client._simulate_missing_close_rpc)
+
+                if getattr(self.client, "_simulate_unexpected_close_rpc", None) and self.fn == "close_call_transaction":
+                    raise Exception(self.client._simulate_unexpected_close_rpc)
+
                 if self.fn == "close_call_transaction":
                     with getattr(self.client, "_lock", threading.Lock()):
                         call_id = self.params.get("p_call_id")
@@ -259,6 +265,12 @@ class MockSupabaseClient:
                     with getattr(self.client, "_lock", threading.Lock()):
                         if getattr(self.client, "_simulate_rpc_failure", False):
                             raise Exception("Simulated PostgreSQL transactional failure during stage write")
+
+                        # Validate incoming finalization parameters
+                        p_ended = self.params.get("p_ended_at")
+                        p_outcome = self.params.get("p_outcome")
+                        if p_ended is not None and p_outcome is None:
+                            raise Exception("DataIntegrityError: ended_at cannot be set without a valid outcome")
 
                         # PostgreSQL transaction scratchpad
                         scratch_calls = [dict(c) for c in self.client.db_state["calls"]]
@@ -2182,20 +2194,24 @@ def test_real_postgresql_matching_sync_retry_preserves_finalization_metadata():
     assert sync_r.returncode == 0, f"Retry failed: {sync_r.stderr}"
     data = json.loads(sync_r.stdout.strip())
 
-    # Metadata must match original
+    # Metadata must match original, including exact ended_at timestamp immutability
     assert data["outcome"] == "meeting_booked"
     assert data["outcome_notes"] == orig_notes
+    dt_ended = datetime.fromisoformat(data["ended_at"]).astimezone(timezone.utc)
+    assert dt_ended == datetime(2026, 10, 23, 14, 0, 0, tzinfo=timezone.utc)
+    assert dt_ended != datetime(2026, 10, 23, 15, 30, 0, tzinfo=timezone.utc)
     assert len(data["stage_results"]) == 1
 
-    # Verify directly in database table
+    # Verify directly in database table that ended_at was NOT replaced by 15:30:00
     chk_cmd = [
         PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
-        f"SELECT outcome, outcome_notes FROM public.calls WHERE id = '{call_id}';"
+        f"SELECT outcome, outcome_notes, to_char(ended_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS') FROM public.calls WHERE id = '{call_id}';"
     ]
     chk_r = subprocess.run(chk_cmd, capture_output=True, text=True)
-    db_outcome, db_notes = chk_r.stdout.strip().split("|")
+    db_outcome, db_notes, db_ended = chk_r.stdout.strip().split("|")
     assert db_outcome == "meeting_booked"
     assert db_notes == orig_notes
+    assert db_ended == "2026-10-23 14:00:00"
 
 
 def test_real_postgresql_conflicting_sync_retry_preserves_original_data():
@@ -2203,14 +2219,21 @@ def test_real_postgresql_conflicting_sync_retry_preserves_original_data():
     REAL POSTGRESQL TEST: Proves that when sync_offline_call_transaction is invoked
     with a conflicting outcome on an already-finalized call:
     1. It fails with 23505 conflict exception.
-    2. Persisted call row and all fields remain completely unaltered.
+    2. Persisted call row and ALL fields remain completely unaltered.
+    3. Confirms NO stage-result mutations survive the failed transaction.
     """
     if not _check_real_postgres():
         pytest.skip("Local PostgreSQL database coldcall_test not available")
 
     client_id = f"pg-conflict-preserve-{uuid4()}"
+    orig_prospect = "Conflict Prospect"
+    orig_company = "Conflict Ltd"
+    orig_stage = "opening"
     orig_notes = "Immutable meeting booked notes"
+    orig_started = "2026-10-23 10:00:00+00"
+    orig_ended = "2026-10-23 10:30:00+00"
 
+    # Step 1: Create finalized call with all known fields
     create_cmd = [
         PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
         f"""
@@ -2218,8 +2241,8 @@ def test_real_postgresql_conflicting_sync_retry_preserves_original_data():
           caller_id, client_call_id, prospect_name, company_name, current_stage_id,
           outcome, outcome_notes, started_at, ended_at
         ) VALUES (
-          'rep-alpha', '{client_id}', 'Conflict Prospect', 'Conflict Ltd', 'opening',
-          'meeting_booked', '{orig_notes}', NOW(), NOW()
+          'rep-alpha', '{client_id}', '{orig_prospect}', '{orig_company}', '{orig_stage}',
+          'meeting_booked', '{orig_notes}', '{orig_started}'::timestamptz, '{orig_ended}'::timestamptz
         ) RETURNING id;
         """
     ]
@@ -2227,21 +2250,37 @@ def test_real_postgresql_conflicting_sync_retry_preserves_original_data():
     assert r.returncode == 0
     call_id = r.stdout.strip().splitlines()[0]
 
-    # Attempt conflicting sync with outcome 'not_interested'
+    # Step 2: Insert an initial verified stage result
+    orig_words = "Original prospect verbatim quote"
+    orig_caller_note = "Original rep note on opening"
+    stage_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        INSERT INTO public.call_stage_results (
+          call_id, stage_id, result, prospect_words, notes
+        ) VALUES (
+          '{call_id}'::uuid, 'opening', 'Initial verified result', '{orig_words}', '{orig_caller_note}'
+        );
+        """
+    ]
+    s_res = subprocess.run(stage_cmd, capture_output=True, text=True)
+    assert s_res.returncode == 0
+
+    # Step 3: Attempt conflicting sync with outcome 'not_interested', mutated fields, and mutated/new stage results
     sync_cmd = [
         PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
         f"""
         SELECT public.sync_offline_call_transaction(
           'rep-alpha',
           '{client_id}',
-          'Conflict Prospect',
-          'Conflict Ltd',
-          'opening',
-          NOW(),
-          NOW(),
+          'Mutated Prospect That Must Fail',
+          'Mutated Corp That Must Fail',
+          'purpose',
+          '2026-10-23 11:00:00+00'::timestamptz,
+          '2026-10-23 11:45:00+00'::timestamptz,
           'not_interested',
-          'Conflicting notes',
-          '[]'::jsonb
+          'Conflicting notes that must not persist',
+          '[{{"stage_id": "opening", "result": "Overwritten result", "prospect_words": "Overwritten words"}}, {{"stage_id": "purpose", "result": "New stage result"}}]'::jsonb
         );
         """
     ]
@@ -2249,15 +2288,42 @@ def test_real_postgresql_conflicting_sync_retry_preserves_original_data():
     assert sync_r.returncode != 0
     assert "already finalized with outcome meeting_booked" in sync_r.stderr
 
-    # Verify persisted fields are unchanged
+    # Step 4: Verify ALL persisted call fields remain completely unchanged
     chk_cmd = [
         PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
-        f"SELECT outcome, outcome_notes FROM public.calls WHERE id = '{call_id}';"
+        f"""
+        SELECT caller_id, client_call_id, prospect_name, company_name, current_stage_id,
+               outcome, outcome_notes,
+               to_char(started_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS'),
+               to_char(ended_at at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS')
+        FROM public.calls WHERE id = '{call_id}';
+        """
     ]
     chk_r = subprocess.run(chk_cmd, capture_output=True, text=True)
-    db_outcome, db_notes = chk_r.stdout.strip().split("|")
-    assert db_outcome == "meeting_booked"
-    assert db_notes == orig_notes
+    parts = chk_r.stdout.strip().split("|")
+    assert parts[0] == "rep-alpha"
+    assert parts[1] == client_id
+    assert parts[2] == orig_prospect
+    assert parts[3] == orig_company
+    assert parts[4] == orig_stage
+    assert parts[5] == "meeting_booked"
+    assert parts[6] == orig_notes
+    assert parts[7] == "2026-10-23 10:00:00"
+    assert parts[8] == "2026-10-23 10:30:00"
+
+    # Step 5: Confirm NO stage-result mutations survived the failed transaction
+    stage_chk = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"SELECT stage_id, result, prospect_words, notes FROM public.call_stage_results WHERE call_id = '{call_id}';"
+    ]
+    stage_r = subprocess.run(stage_chk, capture_output=True, text=True)
+    stage_lines = [l for l in stage_r.stdout.strip().splitlines() if l.strip()]
+    assert len(stage_lines) == 1
+    st_id, st_res, st_words, st_notes = stage_lines[0].split("|")
+    assert st_id == "opening"
+    assert st_res == "Initial verified result"
+    assert st_words == orig_words
+    assert st_notes == orig_caller_note
 
 
 def test_real_postgresql_inconsistent_finalized_records_rejected():
@@ -2327,3 +2393,209 @@ def test_real_postgresql_inconsistent_finalized_records_rejected():
     sync_r = subprocess.run(sync_cmd, capture_output=True, text=True)
     assert sync_r.returncode != 0
     assert "DataIntegrityError" in sync_r.stderr or "ended_at set but outcome is null" in sync_r.stderr
+
+
+def test_sync_offline_call_rejects_ended_at_without_outcome():
+    """
+    REGRESSION TEST: Verify that POST /calls/sync-offline rejects requests
+    where ended_at is supplied but outcome is null with 422 Unprocessable Entity,
+    preventing creation of inconsistent calls.
+    """
+    payload = {
+        "client_call_id": "inc-offline-test-1",
+        "prospect_name": "Inconsistent Offline Prospect",
+        "started_at": "2026-10-23T10:00:00Z",
+        "ended_at": "2026-10-23T10:15:00Z",
+        "outcome": None,
+    }
+    res = client.post("/calls/sync-offline", json=payload)
+    assert res.status_code == 422
+    assert "Inconsistent call state" in res.text or "ended_at cannot be set without a valid outcome" in res.text
+
+
+def test_close_call_fallback_when_rpc_missing(mock_db):
+    """
+    REGRESSION TEST: Verify that when the close_call_transaction RPC does not exist
+    in Supabase (e.g. PostgREST returns 'PGRST202: Could not find the function public.close_call_transaction in the schema cache'),
+    the endpoint falls through to the atomic conditional table update fallback and successfully closes the call.
+    Also verifies that unauthorized caller gets 403, and unexpected database errors return 500.
+    """
+    # 1. Start a call
+    res_start = client.post("/calls", json={"prospect_name": "Fallback Prospect", "company_name": "Fallback Corp"})
+    assert res_start.status_code == 200
+    call_id = res_start.json()["id"]
+
+    # 2. Simulate PostgREST missing function error naming public.close_call_transaction
+    mock_db._simulate_missing_close_rpc = "PGRST202: Could not find the function public.close_call_transaction in the schema cache"
+
+    # 3. Close the call - should successfully use fallback
+    res_close = client.post(
+        f"/calls/{call_id}/close",
+        json={"outcome": "meeting_booked", "outcome_notes": "Closed via schema-cache fallback"}
+    )
+    assert res_close.status_code == 200
+    closed_data = res_close.json()
+    assert closed_data["outcome"] == "meeting_booked"
+    assert closed_data["outcome_notes"] == "Closed via schema-cache fallback"
+    assert closed_data["ended_at"] is not None
+
+    # 4. Idempotent retry with same outcome succeeds
+    res_retry = client.post(
+        f"/calls/{call_id}/close",
+        json={"outcome": "meeting_booked", "outcome_notes": "Retry note"}
+    )
+    assert res_retry.status_code == 200
+    assert res_retry.json()["outcome"] == "meeting_booked"
+
+    # 5. Conflicting outcome returns 409
+    res_conflict = client.post(
+        f"/calls/{call_id}/close",
+        json={"outcome": "not_interested"}
+    )
+    assert res_conflict.status_code == 409
+    assert "conflicting outcome" in res_conflict.text
+
+    # 6. Start another call and test unauthorized caller receives 403
+    res_start2 = client.post("/calls", json={"prospect_name": "Other Rep Call"})
+    call_id2 = res_start2.json()["id"]
+    res_unauth = client.post(
+        f"/calls/{call_id2}/close",
+        json={"outcome": "meeting_booked"},
+        headers={"Authorization": f"Bearer {VALID_CALLER_B_TOKEN}"}
+    )
+    assert res_unauth.status_code == 403
+
+    # 7. Start another call and verify unexpected RPC error returns 500
+    res_start3 = client.post("/calls", json={"prospect_name": "Crash Call"})
+    call_id3 = res_start3.json()["id"]
+    mock_db._simulate_missing_close_rpc = None
+    mock_db._simulate_unexpected_close_rpc = "Connection lost: connection was abruptly closed by peer"
+    res_crash = client.post(
+        f"/calls/{call_id3}/close",
+        json={"outcome": "meeting_booked"}
+    )
+    assert res_crash.status_code == 500
+    assert "Could not close call" in res_crash.text
+    mock_db._simulate_unexpected_close_rpc = None
+
+
+def test_real_postgresql_prevent_new_inconsistent_offline_calls():
+    """
+    REAL POSTGRESQL TEST: Proves that sync_offline_call_transaction strictly rejects
+    any attempt to insert a new call where ended_at is provided but outcome is null,
+    covering BOTH:
+    1. Keyed path (with non-null client_call_id)
+    2. Deliberately unkeyed path (client_call_id is null)
+    And proves that valid open-call behavior is preserved when BOTH fields are null.
+    """
+    if not _check_real_postgres():
+        pytest.skip("Local PostgreSQL database coldcall_test not available")
+
+    # Re-apply migrations
+    subprocess.run([PSQL_BIN, "-d", "coldcall_test", "-f", "supabase/migrations/20261023_secure_sync_offline_rpc.sql"], capture_output=True, text=True)
+
+    # Case 1: Keyed call with ended_at set but outcome NULL -> MUST FAIL
+    keyed_inc_id = f"pg-keyed-inc-{uuid4()}"
+    cmd1 = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SELECT public.sync_offline_call_transaction(
+          'rep-alpha',
+          '{keyed_inc_id}',
+          'Keyed Inconsistent',
+          'Keyed Inc Ltd',
+          'opening',
+          NOW(),
+          NOW(),
+          NULL,
+          'Notes without outcome',
+          '[]'::jsonb
+        );
+        """
+    ]
+    r1 = subprocess.run(cmd1, capture_output=True, text=True)
+    assert r1.returncode != 0
+    assert "DataIntegrityError" in r1.stderr
+    assert "ended_at cannot be set without a valid outcome" in r1.stderr
+
+    # Verify zero calls created for keyed_inc_id
+    chk1 = subprocess.run([PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c", f"SELECT count(*) FROM public.calls WHERE client_call_id = '{keyed_inc_id}';"], capture_output=True, text=True)
+    assert chk1.stdout.strip() == "0"
+
+    # Case 2: Unkeyed call with ended_at set but outcome NULL -> MUST FAIL
+    cmd2 = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SELECT public.sync_offline_call_transaction(
+          'rep-alpha',
+          NULL,
+          'Unkeyed Inconsistent',
+          'Unkeyed Inc Ltd',
+          'opening',
+          NOW(),
+          NOW(),
+          NULL,
+          'Unkeyed notes without outcome',
+          '[]'::jsonb
+        );
+        """
+    ]
+    r2 = subprocess.run(cmd2, capture_output=True, text=True)
+    assert r2.returncode != 0
+    assert "DataIntegrityError" in r2.stderr
+    assert "ended_at cannot be set without a valid outcome" in r2.stderr
+
+    # Case 3: Valid open keyed call (both ended_at and outcome NULL) -> MUST SUCCEED
+    valid_keyed_id = f"pg-valid-open-{uuid4()}"
+    cmd3 = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SELECT public.sync_offline_call_transaction(
+          'rep-alpha',
+          '{valid_keyed_id}',
+          'Valid Open Prospect',
+          'Valid Open Ltd',
+          'opening',
+          NOW(),
+          NULL,
+          NULL,
+          '',
+          '[]'::jsonb
+        );
+        """
+    ]
+    r3 = subprocess.run(cmd3, capture_output=True, text=True)
+    assert r3.returncode == 0, f"Valid open keyed call failed: {r3.stderr}"
+    data3 = json.loads(r3.stdout.strip())
+    assert data3["outcome"] is None
+    assert data3["ended_at"] is None
+    assert data3["client_call_id"] == valid_keyed_id
+
+    # Verify in DB
+    chk3 = subprocess.run([PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c", f"SELECT outcome, ended_at FROM public.calls WHERE client_call_id = '{valid_keyed_id}';"], capture_output=True, text=True)
+    assert chk3.stdout.strip() == "|"
+
+    # Case 4: Valid open unkeyed call (both ended_at and outcome NULL) -> MUST SUCCEED
+    cmd4 = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SELECT public.sync_offline_call_transaction(
+          'rep-alpha',
+          NULL,
+          'Valid Unkeyed Open',
+          'Valid Unkeyed Ltd',
+          'purpose',
+          NOW(),
+          NULL,
+          NULL,
+          '',
+          '[]'::jsonb
+        );
+        """
+    ]
+    r4 = subprocess.run(cmd4, capture_output=True, text=True)
+    assert r4.returncode == 0, f"Valid open unkeyed call failed: {r4.stderr}"
+    data4 = json.loads(r4.stdout.strip())
+    assert data4["outcome"] is None
+    assert data4["ended_at"] is None
+    assert data4["client_call_id"] is None

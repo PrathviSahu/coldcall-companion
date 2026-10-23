@@ -1,7 +1,7 @@
 from __future__ import annotations
 import os
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Self
 from uuid import UUID
 import json
 
@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Security, Depends, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import httpx
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 try:
     from supabase import create_client, Client
@@ -305,6 +305,12 @@ class SyncOfflineCall(BaseModel):
     current_stage_id: str | None = None
     stage_results: list[SaveStage] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def validate_finalization_consistency(self) -> Self:
+        if self.ended_at is not None and self.outcome is None:
+            raise ValueError("Inconsistent call state: ended_at cannot be set without a valid outcome")
+        return self
+
 class UpdateStage(BaseModel):
     stage_id: str
 
@@ -535,7 +541,20 @@ def close_call(
                 detail=f"Call is already closed with conflicting outcome: {err_msg}"
             )
         # If the RPC function does not exist in mock or database, use the atomic conditional table update below
-        if "function close_call_transaction" not in err_msg.lower() and "not implemented" not in err_msg.lower():
+        err_lower = err_msg.lower()
+        is_missing_rpc = (
+            "close_call_transaction" in err_lower
+            and any(k in err_lower for k in [
+                "not exist",
+                "could not find",
+                "not found",
+                "pgrst202",
+                "42883",
+                "schema cache",
+                "not implemented",
+            ])
+        ) or "pgrst202" in err_lower
+        if not is_missing_rpc:
             raise HTTPException(500, f"Could not close call: {exc}")
 
     # 2. Atomic Conditional Table Update (Defense-in-depth / Mock fallback)
@@ -630,6 +649,13 @@ def sync_offline_call(
         raise HTTPException(
             status_code=422,
             detail=f"Invalid timestamps: ended_at ({payload.ended_at.isoformat()}) cannot be before started_at ({payload.started_at.isoformat()})"
+        )
+
+    # 4b. Pre-validate finalization state consistency
+    if payload.ended_at is not None and payload.outcome is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Inconsistent call state: ended_at cannot be set without a valid outcome"
         )
 
     started_at_str = payload.started_at.isoformat() if payload.started_at else datetime.now(timezone.utc).isoformat()

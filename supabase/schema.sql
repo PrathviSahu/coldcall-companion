@@ -250,6 +250,14 @@ begin
     v_clean_client_id := trim(p_client_call_id);
   end if;
 
+  -- Validate incoming finalization parameters:
+  -- Reject requests where ended_at is provided but outcome is null.
+  -- Valid open calls must have both ended_at and outcome as null.
+  if p_ended_at is not null and p_outcome is null then
+    raise exception 'DataIntegrityError: ended_at cannot be set without a valid outcome'
+      using errcode = '23514';
+  end if;
+
   -- 1. Idempotency & Concurrency: If client_call_id is present, serialize and look up
   if v_clean_client_id is not null then
     -- Transaction-level advisory lock serializes concurrent syncs with the exact same caller & client_call_id
@@ -296,6 +304,12 @@ begin
         exit;
       else
         begin
+          -- Defensive check before keyed insert
+          if p_ended_at is not null and p_outcome is null then
+            raise exception 'DataIntegrityError: cannot insert call with ended_at set but outcome null'
+              using errcode = '23514';
+          end if;
+
           insert into public.calls (
             caller_id, client_call_id, prospect_name, company_name,
             current_stage_id, started_at, ended_at, outcome, outcome_notes
@@ -312,6 +326,12 @@ begin
     end loop;
   else
     -- Deliberate null client_call_id path: creates an unkeyed call record
+    -- Defensive check before unkeyed insert
+    if p_ended_at is not null and p_outcome is null then
+      raise exception 'DataIntegrityError: cannot insert call with ended_at set but outcome null'
+        using errcode = '23514';
+    end if;
+
     insert into public.calls (
       caller_id, client_call_id, prospect_name, company_name,
       current_stage_id, started_at, ended_at, outcome, outcome_notes
