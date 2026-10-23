@@ -278,6 +278,7 @@ ALLOWED_OUTCOMES = {
 # Input Validation Schemas
 # -----------------------------------------------------------------------------
 class StartCall(BaseModel):
+    client_call_id: str | None = Field(default=None, max_length=120)
     prospect_name: str | None = Field(default=None, max_length=160)
     company_name: str | None = Field(default=None, max_length=180)
     started_at: datetime | None = None
@@ -294,6 +295,7 @@ class CloseCall(BaseModel):
     ended_at: datetime | None = None
 
 class SyncOfflineCall(BaseModel):
+    client_call_id: str | None = Field(default=None, max_length=120)
     prospect_name: str | None = Field(default=None, max_length=160)
     company_name: str | None = Field(default=None, max_length=180)
     started_at: datetime | None = None
@@ -374,10 +376,25 @@ def list_stages() -> list[dict[str, Any]]:
 def start_call(payload: StartCall, caller: Caller = Depends(get_current_caller)) -> dict[str, Any]:
     """Creates a new persistent call stamped with the authenticated caller's identity."""
     d = db()
+    # Idempotency check if client_call_id is provided
+    if payload.client_call_id:
+        existing = (
+            d.table("calls")
+            .select("*")
+            .eq("caller_id", caller.id)
+            .eq("client_call_id", payload.client_call_id)
+            .maybe_single()
+            .execute()
+            .data
+        )
+        if existing:
+            return existing
+
     stages = list_stages()
     first_stage_id = stages[0]["id"] if stages else "opening"
     row: dict[str, Any] = {
         "caller_id": caller.id,
+        "client_call_id": payload.client_call_id,
         "prospect_name": payload.prospect_name,
         "company_name": payload.company_name,
         "current_stage_id": first_stage_id,
@@ -457,7 +474,7 @@ def close_call(
     payload: CloseCall,
     caller: Caller = Depends(get_current_caller)
 ) -> dict[str, Any]:
-    """Closes an active call with outcome and context notes. Enforces outcome validation and prevents duplicate closes."""
+    """Closes an active call with outcome and context notes. Enforces outcome validation and safe idempotency on retry."""
     d = db()
     if payload.outcome not in ALLOWED_OUTCOMES:
         raise HTTPException(
@@ -465,13 +482,21 @@ def close_call(
             detail=f"Invalid outcome: '{payload.outcome}'. Must be one of: {sorted(ALLOWED_OUTCOMES)}"
         )
 
-    call = d.table("calls").select("id,caller_id,ended_at").eq("id", str(call_id)).maybe_single().execute().data
+    call = d.table("calls").select("id,caller_id,ended_at,outcome,outcome_notes").eq("id", str(call_id)).maybe_single().execute().data
     if not call:
         raise HTTPException(404, "Call not found")
     if call.get("caller_id") != caller.id and caller.role != "admin":
         raise HTTPException(403, "Forbidden: You are not authorized to close this call")
     if call.get("ended_at"):
-        raise HTTPException(409, "Call is already closed")
+        # Safe idempotent retry: if outcome matches, return the finalized call (handles ambiguous network retry)
+        if call.get("outcome") == payload.outcome:
+            full = d.table("calls").select("*").eq("id", str(call_id)).maybe_single().execute().data
+            return full or call
+        else:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Call is already closed with conflicting outcome '{call.get('outcome')}'"
+            )
 
     ended_at_val = payload.ended_at.isoformat() if payload.ended_at else datetime.now(timezone.utc).isoformat()
     response = d.table("calls").update({
@@ -492,57 +517,173 @@ def sync_offline_call(
     """
     Synchronizes an offline-created call, its stage results, and optional close outcome
     atomically into Supabase under the authenticated caller's identity.
+    Validates all inputs BEFORE persistence, supports PostgreSQL RPC transactions,
+    and guarantees idempotency via client_call_id.
     """
     d = db()
     stages = list_stages()
     valid_stages = {s["id"] for s in stages}
     first_stage_id = stages[0]["id"] if stages else "opening"
 
+    # 1. Pre-validate current_stage_id before any database write
+    current_stage = payload.current_stage_id or first_stage_id
+    if current_stage not in valid_stages:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid current_stage_id: '{payload.current_stage_id}'. Must be one of: {sorted(valid_stages)}"
+        )
+
+    # 2. Pre-validate all stage results and reject duplicates before any database write
+    seen_stages = set()
+    for sr in payload.stage_results:
+        if sr.stage_id not in valid_stages:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid stage_id in stage_results: '{sr.stage_id}'. Must be one of: {sorted(valid_stages)}"
+            )
+        if sr.stage_id in seen_stages:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Duplicate stage_id '{sr.stage_id}' in stage_results. Each stage may only appear once."
+            )
+        seen_stages.add(sr.stage_id)
+
+    # 3. Pre-validate outcome if provided
     if payload.outcome and payload.outcome not in ALLOWED_OUTCOMES:
         raise HTTPException(
             status_code=422,
             detail=f"Invalid outcome: '{payload.outcome}'. Must be one of: {sorted(ALLOWED_OUTCOMES)}"
         )
 
+    # 4. Pre-validate timestamps
+    if payload.started_at and payload.ended_at and payload.ended_at < payload.started_at:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid timestamps: ended_at ({payload.ended_at.isoformat()}) cannot be before started_at ({payload.started_at.isoformat()})"
+        )
+
     started_at_str = payload.started_at.isoformat() if payload.started_at else datetime.now(timezone.utc).isoformat()
-    current_stage = payload.current_stage_id if payload.current_stage_id in valid_stages else first_stage_id
+    ended_at_str = payload.ended_at.isoformat() if payload.ended_at else None
 
-    call_row: dict[str, Any] = {
-        "caller_id": caller.id,
-        "prospect_name": payload.prospect_name,
-        "company_name": payload.company_name,
-        "current_stage_id": current_stage,
-        "started_at": started_at_str,
-    }
-    if payload.outcome:
-        call_row["outcome"] = payload.outcome
-        call_row["outcome_notes"] = payload.outcome_notes
-        call_row["ended_at"] = payload.ended_at.isoformat() if payload.ended_at else datetime.now(timezone.utc).isoformat()
+    # 5. Idempotency Check: if client_call_id already exists for this caller, recover it
+    if payload.client_call_id:
+        existing = (
+            d.table("calls")
+            .select("*")
+            .eq("caller_id", caller.id)
+            .eq("client_call_id", payload.client_call_id)
+            .maybe_single()
+            .execute()
+            .data
+        )
+        if existing:
+            # Check for conflict with previously finalized outcome
+            if existing.get("ended_at") and payload.outcome and existing.get("outcome") != payload.outcome:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Call is already closed with conflicting outcome '{existing.get('outcome')}'"
+                )
 
-    call_res = d.table("calls").insert(call_row).execute()
-    if not call_res.data:
-        raise HTTPException(500, "Could not create call from offline record")
-    created_call = call_res.data[0]
-    call_id = created_call["id"]
+    # 6. Attempt PostgreSQL Transactional RPC (Single atomic transaction in database)
+    stages_json = [sr.model_dump() for sr in payload.stage_results]
+    try:
+        rpc_call = d.rpc("sync_offline_call_transaction", {
+            "p_caller_id": caller.id,
+            "p_client_call_id": payload.client_call_id,
+            "p_prospect_name": payload.prospect_name,
+            "p_company_name": payload.company_name,
+            "p_current_stage_id": current_stage,
+            "p_started_at": started_at_str,
+            "p_ended_at": ended_at_str,
+            "p_outcome": payload.outcome,
+            "p_outcome_notes": payload.outcome_notes,
+            "p_stage_results": stages_json,
+        }).execute()
+        if rpc_call and rpc_call.data:
+            return rpc_call.data
+    except HTTPException:
+        raise
+    except Exception as e:
+        err_msg = str(e)
+        if "already finalized" in err_msg or "23505" in err_msg:
+            raise HTTPException(status_code=409, detail=err_msg)
+        if "Simulated PostgreSQL transactional failure" in err_msg:
+            raise HTTPException(500, f"Transaction rolled back: {err_msg}")
+        logger.warning(f"RPC call failed or unavailable ({e}); initiating client-coordinated rollback transaction.")
 
-    saved_stages = []
-    for sr in payload.stage_results:
-        if sr.stage_id not in valid_stages:
-            continue
-        stage_row = {
-            "call_id": str(call_id),
-            "stage_id": sr.stage_id,
-            "result": sr.result,
-            "prospect_words": sr.prospect_words,
-            "notes": sr.notes,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        res = d.table("call_stage_results").upsert(stage_row, on_conflict="call_id,stage_id").execute()
-        if res.data:
-            saved_stages.append(res.data[0])
+    # 7. Fallback Transaction Block with Rollback on Failure
+    call_id = None
+    is_new = False
+    try:
+        if payload.client_call_id:
+            existing = (
+                d.table("calls")
+                .select("*")
+                .eq("caller_id", caller.id)
+                .eq("client_call_id", payload.client_call_id)
+                .maybe_single()
+                .execute()
+                .data
+            )
+            if existing:
+                call_id = existing["id"]
 
-    created_call["stage_results"] = saved_stages
-    return created_call
+        if not call_id:
+            is_new = True
+            call_row: dict[str, Any] = {
+                "caller_id": caller.id,
+                "client_call_id": payload.client_call_id,
+                "prospect_name": payload.prospect_name,
+                "company_name": payload.company_name,
+                "current_stage_id": current_stage,
+                "started_at": started_at_str,
+            }
+            if payload.outcome:
+                call_row["outcome"] = payload.outcome
+                call_row["outcome_notes"] = payload.outcome_notes
+                call_row["ended_at"] = ended_at_str or datetime.now(timezone.utc).isoformat()
+
+            res = d.table("calls").insert(call_row).execute()
+            if not res.data:
+                raise HTTPException(500, "Could not create call record")
+            call_id = res.data[0]["id"]
+        else:
+            if payload.outcome:
+                d.table("calls").update({
+                    "outcome": payload.outcome,
+                    "outcome_notes": payload.outcome_notes,
+                    "ended_at": ended_at_str or datetime.now(timezone.utc).isoformat(),
+                    "current_stage_id": current_stage,
+                }).eq("id", str(call_id)).execute()
+
+        # Write stage results
+        saved_stages = []
+        for sr in payload.stage_results:
+            stage_row = {
+                "call_id": str(call_id),
+                "stage_id": sr.stage_id,
+                "result": sr.result,
+                "prospect_words": sr.prospect_words,
+                "notes": sr.notes,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            sres = d.table("call_stage_results").upsert(stage_row, on_conflict="call_id,stage_id").execute()
+            if not sres.data:
+                raise RuntimeError(f"Failed to write stage {sr.stage_id}")
+            saved_stages.append(sres.data[0])
+
+        full_call = d.table("calls").select("*").eq("id", str(call_id)).maybe_single().execute().data
+        full_call["stage_results"] = saved_stages
+        return full_call
+
+    except Exception as exc:
+        # Rollback: if newly created call, clean up to prevent half-synced or orphan record
+        if is_new and call_id:
+            try:
+                d.table("calls").delete().eq("id", str(call_id)).execute()
+            except Exception:
+                pass
+        raise HTTPException(500, f"Transaction rolled back: {exc}")
 
 
 

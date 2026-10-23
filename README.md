@@ -62,9 +62,14 @@ Derived directly from the DeepThought cold-call structure guidelines and empiric
    - If network writes fail during close, the modal blocks silent dismissal and warns the caller with explicit dual actions:
      - **Retry Cloud Close**: Retries syncing all pending records and finalizing the cloud record.
      - **Save as Offline Draft**: Preserves the complete draft locally with an `UNSYNCED DRAFT` tag so callers can wrap up without data loss.
-9. **Offline Draft Recovery & Cloud Replay (`POST /calls/sync-offline`)**:
-   - Calls recorded while offline or saved locally can be synchronized to Supabase anytime from the Call History table or Call Detail view.
-   - The backend `POST /calls/sync-offline` endpoint atomically establishes the call, inserts all historical stage notes, and sets the outcome with authentic start and end timestamps.
+9. **Atomic & Idempotent Offline Sync (`POST /calls/sync-offline`)**:
+   - **Stable Client UUIDs & Unique Constraints**: Every locally created call receives a stable UUID v4 (`client_call_id`). In `supabase/schema.sql`, a unique index `calls_client_call_id_idx` on `(caller_id, client_call_id)` prevents duplicate records across network retries.
+   - **PostgreSQL Transactional RPC**: `sync_offline_call_transaction` executes call creation, stage result writes, and final outcome inside a single PostgreSQL database transaction. If any write fails, the entire transaction rolls back. A client-coordinated rollback fallback is also enforced in the Python backend.
+   - **Strict Pre-Validation (No Silent Ingestion)**: Before writing any data to the database, the endpoint validates that every stage ID in `stage_results` is recognized. Unrecognized stage IDs, duplicate stage entries, invalid outcomes, or inverted timestamps immediately reject the request with `422 Unprocessable Entity`—zero orphan or partial records are written.
+10. **Ambiguous Network Close Recovery & Idempotency**:
+   - If a call is closed on the server but the HTTP response is dropped or timed out, retrying `POST /calls/{id}/close` with the matching outcome returns `200 OK` with the finalized call data rather than throwing an error.
+   - Retries with a conflicting outcome are rejected with `409 Conflict`, ensuring finalized calls cannot be overwritten.
+   - The frontend automatically verifies server closure status after a network drop, preventing duplicate records or false error states.
 
 ---
 

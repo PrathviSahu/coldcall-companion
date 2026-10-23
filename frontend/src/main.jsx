@@ -200,8 +200,19 @@ async function request(path, options = {}) {
   }
 }
 
+function generateClientCallId() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
 function localId() {
-  return `local-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+  return generateClientCallId();
 }
 
 function initials(name = '') {
@@ -479,6 +490,7 @@ function App() {
         const created = await request('/calls', {
           method: 'POST',
           body: JSON.stringify({
+            client_call_id: currentCall.client_call_id || currentCall.id,
             prospect_name: currentCall.prospect_name?.trim() || null,
             company_name: currentCall.company_name?.trim() || null,
             started_at: currentCall.started_at || new Date().toISOString(),
@@ -596,8 +608,10 @@ function App() {
     setBusy(true);
 
     const firstStage = stages[0] || STAGE_SEED[0];
+    const clientCallId = generateClientCallId();
     const localCallRecord = {
-      id: localId(),
+      id: clientCallId,
+      client_call_id: clientCallId,
       prospect_name: fields.prospect_name.trim() || 'Unnamed prospect',
       company_name: fields.company_name.trim() || '',
       started_at: new Date().toISOString(),
@@ -611,6 +625,7 @@ function App() {
       const created = await request('/calls', {
         method: 'POST',
         body: JSON.stringify({
+          client_call_id: clientCallId,
           prospect_name: fields.prospect_name.trim() || null,
           company_name: fields.company_name.trim() || null,
         }),
@@ -667,8 +682,9 @@ function App() {
       return;
     }
 
-    // 4. Close the server record
+    // 4. Close the server record (with ambiguous network recovery)
     const endedAt = new Date().toISOString();
+    let closeConfirmed = false;
     try {
       await request(`/calls/${currentCall.id}/close`, {
         method: 'POST',
@@ -678,11 +694,22 @@ function App() {
           ended_at: endedAt,
         }),
       });
+      closeConfirmed = true;
     } catch (e) {
-      setBusy(false);
-      setCloseError(`Cloud close failed (${e.message}). The call stages are preserved in Supabase, but the closing status could not be finalized on the server.`);
-      setCloseOfflineConfirm(true);
-      return;
+      // Ambiguous network check: verify if the server actually closed the call
+      try {
+        const verified = await request(`/calls/${currentCall.id}`);
+        if (verified && verified.ended_at && verified.outcome === outcome) {
+          closeConfirmed = true;
+        }
+      } catch {}
+
+      if (!closeConfirmed) {
+        setBusy(false);
+        setCloseError(`Cloud close failed (${e.message}). The call stages are preserved in Supabase, but the closing status could not be finalized on the server.`);
+        setCloseOfflineConfirm(true);
+        return;
+      }
     }
 
     // 5. Cloud close succeeded! Persist to local history
@@ -755,6 +782,7 @@ function App() {
     setError('');
     try {
       const payload = {
+        client_call_id: offlineRecord.client_call_id || offlineRecord.id,
         prospect_name: offlineRecord.prospect_name || null,
         company_name: offlineRecord.company_name || null,
         started_at: offlineRecord.started_at,
@@ -805,6 +833,7 @@ function App() {
     for (const c of offlineCalls) {
       try {
         const payload = {
+          client_call_id: c.client_call_id || c.id,
           prospect_name: c.prospect_name || null,
           company_name: c.company_name || null,
           started_at: c.started_at,

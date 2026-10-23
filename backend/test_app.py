@@ -61,6 +61,10 @@ class MockTableQuery:
         self._update_data = data
         return self
 
+    def delete(self):
+        self._action = "delete"
+        return self
+
     def eq(self, column, value):
         self.filters.append((column, "eq", value))
         return self
@@ -92,6 +96,10 @@ class MockTableQuery:
 
         if self._action == "insert":
             row = dict(self._insert_data)
+            if self.table_name == "calls" and row.get("client_call_id"):
+                for existing in table:
+                    if existing.get("caller_id") == row.get("caller_id") and existing.get("client_call_id") == row.get("client_call_id"):
+                        raise Exception("duplicate key value violates unique constraint 'calls_client_call_id_idx'")
             if "id" not in row:
                 row["id"] = str(uuid4())
             if "created_at" not in row:
@@ -159,6 +167,13 @@ class MockTableQuery:
                 updated.append(dict(item))
             return Result(updated)
 
+        if self._action == "delete":
+            deleted = []
+            for item in list(filtered):
+                table.remove(item)
+                deleted.append(dict(item))
+            return Result(deleted)
+
         # Select action
         if self._order_by:
             filtered.sort(key=lambda x: str(x.get(self._order_by, "")), reverse=self._desc)
@@ -180,9 +195,105 @@ class MockSupabaseClient:
             "calls": [],
             "call_stage_results": [],
         }
+        self._simulate_rpc_failure = False
 
     def table(self, name: str):
         return MockTableQuery(name, self.db_state)
+
+    def rpc(self, func_name: str, params: dict):
+        class MockRpcQuery:
+            def __init__(self, client, fn, p):
+                self.client = client
+                self.fn = fn
+                self.params = p
+
+            def execute(self):
+                class Result:
+                    def __init__(self, data):
+                        self.data = data
+
+                if self.fn == "sync_offline_call_transaction":
+                    if getattr(self.client, "_simulate_rpc_failure", False):
+                        raise Exception("Simulated PostgreSQL transactional failure during stage write")
+
+                    caller_id = self.params.get("p_caller_id")
+                    client_call_id = self.params.get("p_client_call_id")
+                    calls = self.client.db_state["calls"]
+                    stage_results_table = self.client.db_state["call_stage_results"]
+
+                    existing_call = None
+                    if client_call_id:
+                        for c in calls:
+                            if c.get("caller_id") == caller_id and c.get("client_call_id") == client_call_id:
+                                existing_call = c
+                                break
+
+                    if existing_call:
+                        call_id = existing_call["id"]
+                        if self.params.get("p_outcome"):
+                            if existing_call.get("outcome") and existing_call.get("outcome") != self.params.get("p_outcome"):
+                                raise Exception(f"Conflict: Call {call_id} is already finalized with outcome {existing_call.get('outcome')}")
+                            existing_call["outcome"] = self.params.get("p_outcome")
+                            existing_call["outcome_notes"] = self.params.get("p_outcome_notes") or ""
+                            if self.params.get("p_ended_at"):
+                                existing_call["ended_at"] = self.params.get("p_ended_at")
+                        target_call = existing_call
+                    else:
+                        call_id = str(uuid4())
+                        target_call = {
+                            "id": call_id,
+                            "caller_id": caller_id,
+                            "client_call_id": client_call_id,
+                            "prospect_name": self.params.get("p_prospect_name"),
+                            "company_name": self.params.get("p_company_name"),
+                            "current_stage_id": self.params.get("p_current_stage_id"),
+                            "started_at": self.params.get("p_started_at") or datetime.now(timezone.utc).isoformat(),
+                            "ended_at": self.params.get("p_ended_at"),
+                            "outcome": self.params.get("p_outcome"),
+                            "outcome_notes": self.params.get("p_outcome_notes") or "",
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                            "ai_summary": None,
+                        }
+                        calls.append(target_call)
+
+                    stages = self.params.get("p_stage_results") or []
+                    for sr in stages:
+                        st_id = sr.get("stage_id")
+                        res = sr.get("result", "completed")
+                        words = sr.get("prospect_words", "")
+                        notes = sr.get("notes", "")
+
+                        found = False
+                        for existing_sr in stage_results_table:
+                            if existing_sr.get("call_id") == call_id and existing_sr.get("stage_id") == st_id:
+                                existing_sr.update({
+                                    "result": res,
+                                    "prospect_words": words,
+                                    "notes": notes,
+                                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                                })
+                                found = True
+                                break
+                        if not found:
+                            stage_results_table.append({
+                                "id": str(uuid4()),
+                                "call_id": call_id,
+                                "stage_id": st_id,
+                                "result": res,
+                                "prospect_words": words,
+                                "notes": notes,
+                                "created_at": datetime.now(timezone.utc).isoformat(),
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
+                            })
+
+                    saved_stages = [sr for sr in stage_results_table if sr.get("call_id") == call_id]
+                    res_obj = dict(target_call)
+                    res_obj["stage_results"] = saved_stages
+                    return Result(res_obj)
+
+                raise NotImplementedError(f"RPC {self.fn} not implemented in mock")
+
+        return MockRpcQuery(self, func_name, params)
 
 
 @pytest.fixture
@@ -1034,3 +1145,148 @@ def test_sync_offline_call_requires_auth():
     payload = {"prospect_name": "Unauthed Prospect"}
     res = unauthed.post("/calls/sync-offline", json=payload)
     assert res.status_code == 401
+
+
+def test_sync_offline_call_idempotent_retry_same_client_call_id(mock_db):
+    """
+    REGRESSION TEST: Verify that repeated sync requests with the same client_call_id
+    are idempotent, return the same server record, and never create duplicate calls.
+    """
+    client_call_id = "test-client-uuid-987"
+    payload = {
+        "client_call_id": client_call_id,
+        "prospect_name": "Idempotent Prospect",
+        "company_name": "Idempotent Tech Ltd",
+        "started_at": "2026-10-23T15:00:00+00:00",
+        "stage_results": [
+            {"stage_id": "opening", "result": "Reached right person", "notes": "First attempt note"}
+        ],
+    }
+
+    # First attempt: call created
+    res1 = client.post("/calls/sync-offline", json=payload)
+    assert res1.status_code == 200, res1.text
+    call1 = res1.json()
+
+    # Second attempt (simulating lost response or user retry): same client_call_id
+    payload["stage_results"][0]["notes"] = "Updated draft note on retry"
+    res2 = client.post("/calls/sync-offline", json=payload)
+    assert res2.status_code == 200, res2.text
+    call2 = res2.json()
+
+    # Verify same call ID returned and only 1 call exists in database
+    assert call1["id"] == call2["id"]
+    calls_in_db = [c for c in mock_db.db_state["calls"] if c.get("client_call_id") == client_call_id]
+    assert len(calls_in_db) == 1, f"Expected exactly 1 call, got {len(calls_in_db)}"
+
+
+def test_sync_offline_call_rejects_invalid_stage_before_persistence(mock_db):
+    """
+    REGRESSION TEST: Verify that any invalid stage ID in stage_results causes the entire
+    request to be rejected with 422 BEFORE inserting any call record into the database.
+    """
+    initial_calls_count = len(mock_db.db_state["calls"])
+    payload = {
+        "client_call_id": "invalid-stage-test-uuid",
+        "prospect_name": "Corrupt Stage Prospect",
+        "stage_results": [
+            {"stage_id": "opening", "result": "Reached right person"},
+            {"stage_id": "invalid_nonexistent_stage", "result": "bogus"},
+        ],
+    }
+    res = client.post("/calls/sync-offline", json=payload)
+    assert res.status_code == 422
+    assert "Invalid stage_id" in res.text
+
+    # Verify zero calls were written
+    assert len(mock_db.db_state["calls"]) == initial_calls_count
+
+
+def test_sync_offline_call_rejects_duplicate_stage_entries(mock_db):
+    """
+    REGRESSION TEST: Verify that requests containing duplicate entries for the same stage
+    are rejected with 422 before any database writes.
+    """
+    payload = {
+        "client_call_id": "dup-stage-test-uuid",
+        "prospect_name": "Duplicate Stage Prospect",
+        "stage_results": [
+            {"stage_id": "opening", "result": "Attempt 1"},
+            {"stage_id": "opening", "result": "Attempt 2"},
+        ],
+    }
+    res = client.post("/calls/sync-offline", json=payload)
+    assert res.status_code == 422
+    assert "Duplicate stage_id" in res.text
+
+
+def test_sync_offline_call_rejects_inverted_timestamps(mock_db):
+    """
+    REGRESSION TEST: Verify that ended_at earlier than started_at is rejected with 422.
+    """
+    payload = {
+        "prospect_name": "Time Traveler Prospect",
+        "started_at": "2026-10-23T16:00:00+00:00",
+        "ended_at": "2026-10-23T15:00:00+00:00",
+    }
+    res = client.post("/calls/sync-offline", json=payload)
+    assert res.status_code == 422
+    assert "ended_at" in res.text
+
+
+def test_close_call_idempotent_retry_success(mock_db):
+    """
+    REGRESSION TEST: Verify that an ambiguous network retry of an already-closed call
+    with the same outcome returns 200 OK with the finalized call data.
+    """
+    call = client.post("/calls", json={"prospect_name": "Close Retry Prospect"}).json()
+    call_id = call["id"]
+
+    # First close
+    close_payload = {"outcome": "meeting_booked", "outcome_notes": "VP Sales meeting set for Tuesday"}
+    res1 = client.post(f"/calls/{call_id}/close", json=close_payload)
+    assert res1.status_code == 200
+
+    # Ambiguous network retry with identical outcome
+    res2 = client.post(f"/calls/{call_id}/close", json=close_payload)
+    assert res2.status_code == 200
+    assert res2.json()["outcome"] == "meeting_booked"
+    assert res2.json()["ended_at"] is not None
+
+
+def test_close_call_conflicting_outcome_rejected_with_409(mock_db):
+    """
+    REGRESSION TEST: Verify that attempting to close an already-closed call with a
+    conflicting outcome is strictly rejected with 409 Conflict.
+    """
+    call = client.post("/calls", json={"prospect_name": "Conflict Close Prospect"}).json()
+    call_id = call["id"]
+
+    # First close
+    res1 = client.post(f"/calls/{call_id}/close", json={"outcome": "meeting_booked"})
+    assert res1.status_code == 200
+
+    # Retry with conflicting outcome
+    res2 = client.post(f"/calls/{call_id}/close", json={"outcome": "not_interested"})
+    assert res2.status_code == 409
+    assert "conflicting outcome" in res2.text
+
+
+def test_sync_offline_call_transactional_rollback(mock_db):
+    """
+    REGRESSION TEST: Verify that if an RPC failure occurs, the transaction rolls back
+    and raises 500 without leaving an orphan or corrupt call record.
+    """
+    mock_db._simulate_rpc_failure = True
+    initial_calls_count = len(mock_db.db_state["calls"])
+    payload = {
+        "client_call_id": "rollback-test-uuid",
+        "prospect_name": "Rollback Prospect",
+        "stage_results": [{"stage_id": "opening", "result": "Reached right person"}],
+    }
+    res = client.post("/calls/sync-offline", json=payload)
+    assert res.status_code == 500
+    assert "rolled back" in res.text
+
+    # Verify no orphan calls left in db
+    assert len(mock_db.db_state["calls"]) == initial_calls_count
