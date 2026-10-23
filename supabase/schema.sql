@@ -46,7 +46,7 @@ alter table public.call_stages enable row level security;
 alter table public.calls enable row level security;
 alter table public.call_stage_results enable row level security;
 
--- Seed the exact 8 cold call stages in authentic sequence with empirical prospect patterns
+-- Seed the 8 cold-call stages with aggregated, paraphrased behavioral patterns
 insert into public.call_stages (id, position, title, purpose, guidance, prospect_patterns, stage_taps) values
 (
   'opening',
@@ -54,7 +54,7 @@ insert into public.call_stages (id, position, title, purpose, guidance, prospect
   'Opening',
   'Reach the right person and say who you are. The prospect decides in the first ten seconds whether this call is worth a minute.',
   'Be brief, direct, and natural. Verify identity immediately; do not pitch to an assistant or switchboard.',
-  '["Can you please come again? From where are you calling?","I''ll let you know the concerned person. You can call directly.","The person you are asking for left the company last year."]'::jsonb,
+  '["Could you clarify which company you represent?","The concerned manager is someone else; I can share their direct extension.","The person you are inquiring about has left the organization."]'::jsonb,
   '["Reached right person","Wrong person / referral","Contact left company","Switchboard / PA barrier"]'::jsonb
 ),
 (
@@ -63,8 +63,8 @@ insert into public.call_stages (id, position, title, purpose, guidance, prospect
   'Purpose',
   'Say in one or two sentences why you called, in words the prospect can repeat to a colleague. A purpose they cannot repeat is a purpose they did not hear.',
   'Give a concrete reason for calling without corporate jargon. Avoid sounding like a scripted telemarketer.',
-  '["What is this about? Can you just elaborate?","Uh, from where? What does your company do?","Who gave you this number? Where did you get my contact?","Is this a sales call? What are you proposing?"]'::jsonb,
-  '["Understood & listening","Asked what company does","Asked where we got number","Flagged as sales call"]'::jsonb
+  '["Can you give me a one-sentence summary of what your company does?","Where did you get my contact number?","Is this an outbound sales inquiry?"]'::jsonb,
+  '["Asked what we do","Asked where we got number","Said it is a sales call","Let me go on"]'::jsonb
 ),
 (
   'permission',
@@ -72,7 +72,7 @@ insert into public.call_stages (id, position, title, purpose, guidance, prospect
   'Permission',
   'Find out whether they are willing to talk now. A clear yes, a clear no, or a time to call back are all good outcomes. Talking on without one is not.',
   'Test whether they have time right now. Never talk over a busy prospect; secure a specific callback window.',
-  '["Actually right now I''m in a customer meeting. Can you call after 2 PM?","I am driving right now, but tell me quickly.","Can you call me tomorrow afternoon? I will have a few minutes.","Send it on WhatsApp first. Let me see it before we talk."]'::jsonb,
+  '["I am currently in a client meeting; please call back after 2 PM.","I am currently in transit, but you have one minute to explain.","Please share details on WhatsApp or email prior to a call."]'::jsonb,
   '["Agreed to talk now","Callback requested (named time)","Driving / in meeting","Send WhatsApp/Email first"]'::jsonb
 ),
 (
@@ -81,7 +81,7 @@ insert into public.call_stages (id, position, title, purpose, guidance, prospect
   'Their business',
   'Ask about their company and their work before saying anything about yours. People talk about what they do; they rarely listen to what you do.',
   'Ask an informed, open question about their operations or focus. Let them speak first; do not jump to the pitch.',
-  '["Tell me about your company first, then we can get into details.","Our company is the market leader; we don''t fit that profile.","That pertains to manufacturing; I only handle corporate strategy.","We operate primarily through an authorized distributor network."]'::jsonb,
+  '["Tell me about your firm first before we discuss our operations.","We are market leaders; that operational model does not apply to us.","That falls under manufacturing; I only manage corporate strategy."]'::jsonb,
   '["Shared operations & setup","Corrected business model","Turned question to caller","Gave minimal 1-line answer"]'::jsonb
 ),
 (
@@ -90,7 +90,7 @@ insert into public.call_stages (id, position, title, purpose, guidance, prospect
   'Their need, in their words',
   'Hear what they are trying to do or struggling with, in their own words. This is the one stage where the caller writes down exactly what was said.',
   'Log their exact words verbatim in the quote box. Do not summarize or paraphrase what they said.',
-  '["Our main priority right now is expanding export margins and plant utilization.","We don''t believe in external experiments. We are fine with our current business.","Because we are still an early startup, we don''t have the budget or requirement for that now.","What exactly would you require from our side to make this work?"]'::jsonb,
+  '["Our current priority is improving plant capacity utilization and export margins.","Our current business operations are completely stable; no advisory is required.","We are an early-stage startup with limited budget for external consultants."]'::jsonb,
   '["Stated specific priority/bottleneck","Said everything is fine / no need","Startup / too early for advisory","Asked what we can do for them"]'::jsonb
 ),
 (
@@ -99,16 +99,16 @@ insert into public.call_stages (id, position, title, purpose, guidance, prospect
   'Objection',
   'Hear the reason for a no and understand it. A reason you understand can be answered on this call or the next; a reason you talked over cannot.',
   'Acknowledge the objection without becoming defensive. Clarify whether it is contract lock-in, internal capability, or bad timing.',
-  '["Because we are an MNC, we already have such consultants at a global level under a single contract.","We already engaged a consultant last month; that''s going to run for two quarters.","We have a robust process internally which we use for problem solving; we don''t outsource.","I am not interested in this at the moment. Thank you for asking though."]'::jsonb,
+  '["We have a multi-year global contract with an enterprise advisory partner.","We have a robust internal team and process for operational problem solving.","This is not an active priority for us at this time."]'::jsonb,
   '["Global contract / locked vendor","Internal team / robust process","No budget / not a priority","Send info in writing first"]'::jsonb
 ),
 (
   'next_step',
   7,
   'Next step',
-  'Agree one concrete thing: a document on WhatsApp or email, a call at a named time, a meeting. One thing, named, with a time or a channel.',
+  'Agree on one concrete thing: a document on WhatsApp or email, a call at a named time, a meeting. One thing, named, with a time or a channel.',
   'Lock down a specific channel or date/time. A time named by them is worth more than a time proposed by you.',
-  '["You send it on WhatsApp to this number. Let me have a look and come back to you.","That''s my personal email; please send it to my official company ID.","Give me a call sometime Tuesday morning around 11:30 AM after my meeting.","You can send an email with your previous profiles and case studies for review."]'::jsonb,
+  '["Please send a summary on WhatsApp and I will review it.","Please send documentation to my official corporate email address.","Call me on Tuesday at 11:30 AM following our management review."]'::jsonb,
   '["Specific callback time set","Official email deck agreed","WhatsApp brief requested","Referred to colleague with contact"]'::jsonb
 ),
 (
@@ -117,7 +117,7 @@ insert into public.call_stages (id, position, title, purpose, guidance, prospect
   'Close',
   'End the call clearly and record what happened: the outcome, the next step, and the prospect''s words from stage 5. The record is what the next call is built on.',
   'End professionally and immediately record the honest outcome. Never log an outcome that contradicts what the prospect said.',
-  '["Sure, thank you Priya/Rohit. Send it over email and we will connect next week.","All set. Thank you for your time, have a good day.","Okay, fine, works. Bye.","[Call disconnected / line dropped]"]'::jsonb,
+  '["Confirmed; send the email and we will speak next week.","Thank you for reaching out; have a good day.","[Call disconnected / line dropped]"]'::jsonb,
   '["Confirmed next step & closed clean","Polite exit after objection","Line dropped / hung up","Logged discrepancy for next call"]'::jsonb
 )
 on conflict (id) do update set

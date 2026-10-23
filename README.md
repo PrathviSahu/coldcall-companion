@@ -1,6 +1,6 @@
 # ColdCall Companion
 
-A focused, editorial live-call side screen for outbound callers reaching Indian business leaders. Follow the eight proven call stages, anticipate authentic prospect responses derived from 100 empirical transcripts, log single-tap outcomes and exact verbatim prospect words, and review completed and abandoned calls.
+A focused, editorial live-call side screen for outbound callers reaching Indian business leaders. Follow the eight proven call stages, anticipate aggregated prospect response patterns derived from 100 empirical transcripts, log single-tap outcomes and exact verbatim prospect words, and review completed and abandoned calls.
 
 - **GitHub Repository**: [https://github.com/PrathviSahu/coldcall-companion](https://github.com/PrathviSahu/coldcall-companion)
 
@@ -34,7 +34,7 @@ Derived directly from the DeepThought cold-call structure guidelines and empiric
 ## Key Engineering & Product Decisions
 
 1. **Empirical Utterances & Quick Taps**:
-   - Analysis of 100 transcripts revealed that 68% of calls last between 31 and 120 seconds. Callers cannot type long notes during live calls.
+   - Analysis of 100 transcripts revealed that 68% of calls conclude in two minutes (120 seconds) or less (25% under 60 seconds, 43% between 61 and 120 seconds). Callers cannot type long notes during live calls.
    - Each stage features 4 quick outcome taps for single-click logging alongside empirical "What you may hear" cues.
 2. **Zero Async Race Conditions**:
    - Stage transitions (`goToStage`) strictly await the persistence of the current stage before moving to the target index, preventing dropped quotes or overwriting unsaved notes.
