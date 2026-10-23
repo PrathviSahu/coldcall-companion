@@ -160,12 +160,27 @@ const OUTCOMES = [
   { id: 'other', label: 'Other', tone: 'gray' },
 ];
 
+const CALLER_TOKEN_KEY = 'sidecall_caller_token';
+
+function getCallerToken() {
+  try {
+    return localStorage.getItem(CALLER_TOKEN_KEY) || 'fde-rep-101';
+  } catch {
+    return 'fde-rep-101';
+  }
+}
+
 async function request(path, options = {}) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 8000);
   try {
+    const token = getCallerToken();
     const res = await fetch(`${API}${path}`, {
-      headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(options.headers || {}),
+      },
       signal: controller.signal,
       ...options,
     });
@@ -637,7 +652,7 @@ function App() {
                 </>
               )}
             </div>
-            <div className="avatar" title="Caller Profile">
+            <div className="avatar" title={`Caller: ${getCallerToken()} (Role: caller)`}>
               FDE
             </div>
           </div>
@@ -754,15 +769,15 @@ function App() {
                   <div className="lc-header-right">
                     {activeCall.isLocal ? (
                       <span className="lc-conn-badge lc-conn-local">
-                        <span className="lc-conn-dot" style={{background:'#c7a75c'}} /> LOCAL ONLY
+                        <span className="lc-conn-dot lc-conn-dot--local" /> LOCAL ONLY
                       </span>
                     ) : apiState === 'connected' ? (
                       <span className="lc-conn-badge lc-conn-synced">
-                        <span className="lc-conn-dot" style={{background:'#5ea874'}} /> SYNCED
+                        <span className="lc-conn-dot lc-conn-dot--synced" /> SYNCED
                       </span>
                     ) : (
                       <span className="lc-conn-badge lc-conn-offline">
-                        <span className="lc-conn-dot" style={{background:'#d18b78'}} /> OFFLINE
+                        <span className="lc-conn-dot lc-conn-dot--offline" /> OFFLINE
                       </span>
                     )}
                     <button

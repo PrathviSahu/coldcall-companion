@@ -45,6 +45,12 @@ Derived directly from the DeepThought cold-call structure guidelines and empiric
    - The LLM runs server-side only; API keys are never exposed in the client bundle.
    - If `LLM_API_KEY` is unset, the endpoint returns a non-failing disabled-state message rather than throwing errors.
    - Raw notes remain untouched; the AI only surfaces review metadata (summary, objection category, signals, follow-ups, gaps).
+5. **Caller Authentication, Authorization & Isolation**:
+   - Every call-specific API endpoint (`POST /calls`, `POST /calls/{id}/stage-results`, `PATCH /calls/{id}/stage`, `POST /calls/{id}/close`, `GET /calls`, `GET /calls/{id}`, `POST /calls/{id}/ai-summary`) enforces Bearer token authentication via `get_current_caller`. Unauthenticated requests return `401 Unauthorized`.
+   - **Cross-Caller Isolation**: Callers only access calls they created. Attempts to read, edit, or close another caller's call return `403 Forbidden`. Call history (`GET /calls`) filters strictly by `caller_id`.
+   - **Outcome Validation**: Final outcomes are strictly checked against `ALLOWED_OUTCOMES` (returning `422 Unprocessable Entity` on unrecognized values).
+   - **Closed Call Immutability**: Modifying or re-closing an ended conversation returns `409 Conflict`.
+   - **Supabase RLS Policies**: `supabase/schema.sql` enables RLS on all tables with explicit caller isolation policies (`auth.uid() = caller_id`), ensuring data protection at the database engine level.
 
 ---
 

@@ -1,5 +1,12 @@
+-- =============================================================================
+-- COLDCALL COMPANION — SUPABASE POSTGRESQL SCHEMA & RLS POLICIES
+-- =============================================================================
+
 create extension if not exists pgcrypto;
 
+-- -----------------------------------------------------------------------------
+-- 1. Call Stages Table
+-- -----------------------------------------------------------------------------
 create table if not exists public.call_stages (
   id text primary key,
   position integer not null unique,
@@ -10,11 +17,15 @@ create table if not exists public.call_stages (
   stage_taps jsonb not null default '[]'::jsonb
 );
 
--- Upgrade column if table already exists
+-- Upgrade column if table already exists from earlier migrations
 alter table public.call_stages add column if not exists stage_taps jsonb not null default '[]'::jsonb;
 
+-- -----------------------------------------------------------------------------
+-- 2. Calls Table (Caller Isolation & State)
+-- -----------------------------------------------------------------------------
 create table if not exists public.calls (
   id uuid primary key default gen_random_uuid(),
+  caller_id text not null default 'anonymous-caller',
   prospect_name text,
   company_name text,
   started_at timestamptz not null default now(),
@@ -26,6 +37,13 @@ create table if not exists public.calls (
   created_at timestamptz not null default now()
 );
 
+-- Safe column upgrade for existing databases
+alter table public.calls add column if not exists caller_id text not null default 'anonymous-caller';
+alter table public.calls add column if not exists ai_summary jsonb;
+
+-- -----------------------------------------------------------------------------
+-- 3. Stage Results Table (Idempotent Upsert on call_id, stage_id)
+-- -----------------------------------------------------------------------------
 create table if not exists public.call_stage_results (
   id uuid primary key default gen_random_uuid(),
   call_id uuid not null references public.calls(id) on delete cascade,
@@ -38,15 +56,46 @@ create table if not exists public.call_stage_results (
   unique(call_id, stage_id)
 );
 
+-- Indexes for performant filtering and sorting
 create index if not exists calls_started_at_idx on public.calls(started_at desc);
+create index if not exists calls_caller_started_idx on public.calls(caller_id, started_at desc);
 create index if not exists call_stage_results_call_idx on public.call_stage_results(call_id, created_at);
 
--- The API uses the server-only service-role key. Do not expose this key to a browser.
+-- -----------------------------------------------------------------------------
+-- 4. Row Level Security (RLS) & Access Policies
+-- -----------------------------------------------------------------------------
 alter table public.call_stages enable row level security;
 alter table public.calls enable row level security;
 alter table public.call_stage_results enable row level security;
 
--- Seed the 8 cold-call stages with aggregated, paraphrased behavioral patterns
+-- Stages Policy: Public read-only for application reference
+drop policy if exists "call_stages_read_all" on public.call_stages;
+create policy "call_stages_read_all" on public.call_stages
+  for select using (true);
+
+-- Calls Policy: Authenticated caller isolation + Service Role full access
+drop policy if exists "calls_caller_isolation" on public.calls;
+create policy "calls_caller_isolation" on public.calls
+  for all using (
+    auth.role() = 'service_role' or
+    (auth.uid() is not null and caller_id = auth.uid()::text)
+  );
+
+-- Stage Results Policy: Cascade isolation through parent call
+drop policy if exists "stage_results_caller_isolation" on public.call_stage_results;
+create policy "stage_results_caller_isolation" on public.call_stage_results
+  for all using (
+    auth.role() = 'service_role' or
+    exists (
+      select 1 from public.calls c
+      where c.id = call_stage_results.call_id
+      and (auth.role() = 'service_role' or (auth.uid() is not null and c.caller_id = auth.uid()::text))
+    )
+  );
+
+-- -----------------------------------------------------------------------------
+-- 5. Seed the Eight Outbound Stages
+-- -----------------------------------------------------------------------------
 insert into public.call_stages (id, position, title, purpose, guidance, prospect_patterns, stage_taps) values
 (
   'opening',
@@ -64,7 +113,7 @@ insert into public.call_stages (id, position, title, purpose, guidance, prospect
   'Say in one or two sentences why you called, in words the prospect can repeat to a colleague. A purpose they cannot repeat is a purpose they did not hear.',
   'Give a concrete reason for calling without corporate jargon. Avoid sounding like a scripted telemarketer.',
   '["Can you give me a one-sentence summary of what your company does?","Where did you get my contact number?","Is this an outbound sales inquiry?"]'::jsonb,
-  '["Asked what we do","Asked where we got number","Said it is a sales call","Let me go on"]'::jsonb
+  '["Understood & listening","Asked what company does","Asked where we got number","Flagged as sales call"]'::jsonb
 ),
 (
   'permission',
@@ -127,6 +176,3 @@ on conflict (id) do update set
   guidance = excluded.guidance,
   prospect_patterns = excluded.prospect_patterns,
   stage_taps = excluded.stage_taps;
-
--- Safe upgrade if tables were created by an earlier version
-alter table public.calls add column if not exists ai_summary jsonb;

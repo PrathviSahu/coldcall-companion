@@ -9,6 +9,7 @@ from app import app, STARTER_STAGES
 import app as app_module
 
 client = TestClient(app)
+client.headers.update({"Authorization": "Bearer fde-rep-101"})
 
 
 # -----------------------------------------------------------------------------
@@ -591,3 +592,187 @@ def test_llm_failure_does_not_corrupt_call_data(mock_db, monkeypatch):
     stage_map = {s["stage_id"]: s for s in detail["stage_results"]}
     assert stage_map["their_need"]["prospect_words"] == exact_quote
     assert stage_map["their_need"]["notes"] == "Very firm on in-house portal."
+
+
+# -----------------------------------------------------------------------------
+# Security & Authorization Tests (Authentication, Isolation, Validation)
+# -----------------------------------------------------------------------------
+
+def test_unauthenticated_requests_return_401(mock_db):
+    unauthed_client = TestClient(app)  # No Authorization header
+    call_id = str(uuid4())
+
+    # 1. Starting a call without auth
+    res = unauthed_client.post("/calls", json={"prospect_name": "Ghost"})
+    assert res.status_code == 401
+    assert "Authentication required" in res.json()["detail"]
+
+    # 2. Reading history without auth
+    res = unauthed_client.get("/calls")
+    assert res.status_code == 401
+
+    # 3. Reading call detail without auth
+    res = unauthed_client.get(f"/calls/{call_id}")
+    assert res.status_code == 401
+
+    # 4. Saving stage without auth
+    res = unauthed_client.post(
+        f"/calls/{call_id}/stage-results",
+        json={"stage_id": "opening", "result": "Reached right person"},
+    )
+    assert res.status_code == 401
+
+    # 5. Closing call without auth
+    res = unauthed_client.post(
+        f"/calls/{call_id}/close",
+        json={"outcome": "meeting_booked"},
+    )
+    assert res.status_code == 401
+
+    # 6. Invalid token returns 401
+    res = client.get("/calls", headers={"Authorization": "Bearer totally-invalid-token-xyz"})
+    assert res.status_code == 401
+    assert "Invalid authentication token" in res.json()["detail"]
+
+
+def test_unauthorized_cross_caller_access_returns_403(mock_db):
+    caller_a_client = TestClient(app)
+    caller_a_client.headers.update({"Authorization": "Bearer fde-rep-101"})
+
+    caller_b_client = TestClient(app)
+    caller_b_client.headers.update({"Authorization": "Bearer fde-rep-102"})
+
+    # Caller A creates a call
+    create_res = caller_a_client.post(
+        "/calls",
+        json={"prospect_name": "Aman Gupta", "company_name": "BoAt Lifestyle"},
+    )
+    assert create_res.status_code == 200
+    call_id = create_res.json()["id"]
+
+    # Caller B attempts to view Caller A's call details -> 403 Forbidden
+    view_res = caller_b_client.get(f"/calls/{call_id}")
+    assert view_res.status_code == 403
+    assert "Forbidden" in view_res.json()["detail"]
+
+    # Caller B attempts to save stage results on Caller A's call -> 403 Forbidden
+    save_res = caller_b_client.post(
+        f"/calls/{call_id}/stage-results",
+        json={"stage_id": "opening", "result": "Reached right person"},
+    )
+    assert save_res.status_code == 403
+    assert "Forbidden" in save_res.json()["detail"]
+
+    # Caller B attempts to update stage navigation on Caller A's call -> 403 Forbidden
+    stage_res = caller_b_client.patch(
+        f"/calls/{call_id}/stage",
+        json={"stage_id": "purpose"},
+    )
+    assert stage_res.status_code == 403
+    assert "Forbidden" in stage_res.json()["detail"]
+
+    # Caller B attempts to close Caller A's call -> 403 Forbidden
+    close_res = caller_b_client.post(
+        f"/calls/{call_id}/close",
+        json={"outcome": "not_interested"},
+    )
+    assert close_res.status_code == 403
+    assert "Forbidden" in close_res.json()["detail"]
+
+    # Caller B attempts to generate AI summary on Caller A's call -> 403 Forbidden
+    ai_res = caller_b_client.post(
+        f"/calls/{call_id}/ai-summary",
+        json={"refresh": False},
+    )
+    assert ai_res.status_code == 403
+    assert "Forbidden" in ai_res.json()["detail"]
+
+
+def test_caller_history_isolation(mock_db):
+    caller_a = TestClient(app)
+    caller_a.headers.update({"Authorization": "Bearer fde-rep-101"})
+
+    caller_b = TestClient(app)
+    caller_b.headers.update({"Authorization": "Bearer fde-rep-102"})
+
+    admin = TestClient(app)
+    admin.headers.update({"Authorization": "Bearer admin-token-secret"})
+
+    # Caller A logs Call A
+    caller_a.post("/calls", json={"prospect_name": "Alpha Corp Lead"})
+    # Caller B logs Call B
+    caller_b.post("/calls", json={"prospect_name": "Beta Industries Lead"})
+
+    # Caller A history only shows Alpha Corp Lead
+    history_a = caller_a.get("/calls").json()
+    assert len(history_a) == 1
+    assert history_a[0]["prospect_name"] == "Alpha Corp Lead"
+
+    # Caller B history only shows Beta Industries Lead
+    history_b = caller_b.get("/calls").json()
+    assert len(history_b) == 1
+    assert history_b[0]["prospect_name"] == "Beta Industries Lead"
+
+    # Admin history sees both calls
+    admin_history = admin.get("/calls").json()
+    assert len(admin_history) >= 2
+
+
+def test_invalid_outcome_validation_returns_422(mock_db):
+    call = client.post("/calls", json={"prospect_name": "Test Outcome Prospect"}).json()
+    call_id = call["id"]
+
+    # Invalid outcome value
+    res = client.post(
+        f"/calls/{call_id}/close",
+        json={"outcome": "fake_outcome_value", "outcome_notes": "Attempting invalid outcome"},
+    )
+    assert res.status_code == 422
+    assert "Invalid outcome" in res.json()["detail"]
+
+    # Valid outcome value succeeds
+    res_valid = client.post(
+        f"/calls/{call_id}/close",
+        json={"outcome": "next_step_agreed", "outcome_notes": "Valid outcome notes"},
+    )
+    assert res_valid.status_code == 200
+    assert res_valid.json()["outcome"] == "next_step_agreed"
+
+
+def test_cannot_close_already_closed_call_returns_409(mock_db):
+    call = client.post("/calls", json={"prospect_name": "Double Close Lead"}).json()
+    call_id = call["id"]
+
+    # First close succeeds
+    res1 = client.post(
+        f"/calls/{call_id}/close",
+        json={"outcome": "not_interested", "outcome_notes": "First close"},
+    )
+    assert res1.status_code == 200
+
+    # Second close attempt returns 409 Conflict
+    res2 = client.post(
+        f"/calls/{call_id}/close",
+        json={"outcome": "meeting_booked", "outcome_notes": "Attempt to change outcome"},
+    )
+    assert res2.status_code == 409
+    assert "already closed" in res2.json()["detail"]
+
+
+def test_real_supabase_live_connectivity_check():
+    """
+    Explicit check for live Supabase environment.
+    Runs against real database if credentials exist; skips honestly when unset.
+    """
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    if not url or not key:
+        pytest.skip(
+            "Live Supabase credentials (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY) not configured in local environment; "
+            "skipping live cloud connection test in favor of in-memory client test."
+        )
+
+    from supabase import create_client
+    live_client = create_client(url, key)
+    stages = live_client.table("call_stages").select("id,position,title").order("position").execute()
+    assert len(stages.data) == 8, f"Expected 8 stages in live Supabase, got {len(stages.data)}"

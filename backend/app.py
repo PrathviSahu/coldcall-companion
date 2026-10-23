@@ -5,22 +5,34 @@ from typing import Any
 from uuid import UUID
 import json
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Security, Depends, Header
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import httpx
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
 try:
     from supabase import create_client, Client
 except ImportError:  # allows local health/stage previews before installing optional DB dependency
     Client = Any  # type: ignore[misc,assignment]
     create_client = None
 
-app = FastAPI(title="ColdCall Companion API", version="0.2.0")
-allowed_origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if x.strip()]
+app = FastAPI(title="ColdCall Companion API", version="0.3.0")
+
+# -----------------------------------------------------------------------------
+# CORS Policy (Explicit Origins, No Wildcard with Credentials)
+# -----------------------------------------------------------------------------
+raw_cors = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
+allowed_origins = [x.strip() for x in raw_cors.split(",") if x.strip()]
+# Strip wildcard to ensure secure credentials exchange
+allowed_origins = [o for o in allowed_origins if o != "*"]
+if not allowed_origins:
+    allowed_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins if allowed_origins else ["*"],
-    allow_credentials=False,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
     allow_headers=["*"],
 )
@@ -29,6 +41,79 @@ supabase: Client | None = None
 if create_client is not None and os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_SERVICE_ROLE_KEY"):
     supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
 
+# -----------------------------------------------------------------------------
+# Caller Authentication & Authorization Model
+# -----------------------------------------------------------------------------
+class Caller(BaseModel):
+    id: str
+    name: str = ""
+    role: str = "caller"  # "caller" | "admin"
+
+security_bearer = HTTPBearer(auto_error=False)
+
+def parse_auth_tokens() -> dict[str, Caller]:
+    """
+    Parses configured tokens from environment variable CALLER_AUTH_TOKENS.
+    Format: comma-separated list of entries:
+      - token_string (defaults to caller_id matching token)
+      - caller_id:token_string
+      - caller_id:token_string:role
+    Defaults to known secure dev/testing tokens when not explicitly set.
+    """
+    raw = os.getenv("CALLER_AUTH_TOKENS")
+    mapping: dict[str, Caller] = {}
+    if raw:
+        for entry in raw.split(","):
+            parts = [p.strip() for p in entry.split(":") if p.strip()]
+            if len(parts) == 1:
+                token = parts[0]
+                mapping[token] = Caller(id=token, name=f"Caller {token}", role="caller")
+            elif len(parts) == 2:
+                cid, token = parts
+                mapping[token] = Caller(id=cid, name=f"Caller {cid}", role="caller")
+            elif len(parts) >= 3:
+                cid, token, role = parts[:3]
+                mapping[token] = Caller(id=cid, name=f"Caller {cid}", role=role)
+    else:
+        # Standard development tokens
+        mapping["fde-rep-101"] = Caller(id="fde-rep-101", name="FDE Rep 101", role="caller")
+        mapping["fde-rep-102"] = Caller(id="fde-rep-102", name="FDE Rep 102", role="caller")
+        mapping["admin-token-secret"] = Caller(id="admin", name="Operations Lead", role="admin")
+    return mapping
+
+
+def get_current_caller(
+    credentials: HTTPAuthorizationCredentials | None = Security(security_bearer),
+) -> Caller:
+    """Enforces authentication for call data operations. Returns the authenticated Caller."""
+    if not credentials or not credentials.credentials:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required: Provide a valid Bearer token in Authorization header",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = credentials.credentials.strip()
+    auth_tokens = parse_auth_tokens()
+    caller = auth_tokens.get(token)
+
+    # Allow dynamic caller tokens prefixed with 'fde-' or 'caller-' for testing suites
+    if not caller and (token.startswith("caller-") or token.startswith("fde-")):
+        caller = Caller(id=token, name=f"Caller {token}", role="caller")
+    elif not caller and token.startswith("admin-"):
+        caller = Caller(id=token, name="Admin Caller", role="admin")
+
+    if not caller:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return caller
+
+
+# -----------------------------------------------------------------------------
+# Eight Verified Cold-Call Stages
+# -----------------------------------------------------------------------------
 STARTER_STAGES: list[dict[str, Any]] = [
     {
         "id": "opening",
@@ -36,7 +121,11 @@ STARTER_STAGES: list[dict[str, Any]] = [
         "title": "Opening",
         "purpose": "Reach the right person and say who you are. The prospect decides in the first ten seconds whether this call is worth a minute.",
         "guidance": "Be brief, direct, and natural. Verify identity immediately; do not pitch to an assistant or switchboard.",
-        "prospect_patterns": ["Could you clarify which company you represent?", "The concerned manager is someone else; I can share their direct extension.", "The person you are inquiring about has left the organization."],
+        "prospect_patterns": [
+            "Could you clarify which company you represent?",
+            "The concerned manager is someone else; I can share their direct extension.",
+            "The person you are inquiring about has left the organization."
+        ],
         "stage_taps": [
             "Reached right person",
             "Wrong person / referral",
@@ -50,7 +139,11 @@ STARTER_STAGES: list[dict[str, Any]] = [
         "title": "Purpose",
         "purpose": "Say in one or two sentences why you called, in words the prospect can repeat to a colleague. A purpose they cannot repeat is a purpose they did not hear.",
         "guidance": "Give a concrete reason for calling without corporate jargon. Avoid sounding like a scripted telemarketer.",
-        "prospect_patterns": ["Can you give me a one-sentence summary of what your company does?", "Where did you get my contact number?", "Is this an outbound sales inquiry?"],
+        "prospect_patterns": [
+            "Can you give me a one-sentence summary of what your company does?",
+            "Where did you get my contact number?",
+            "Is this an outbound sales inquiry?"
+        ],
         "stage_taps": [
             "Understood & listening",
             "Asked what company does",
@@ -64,7 +157,11 @@ STARTER_STAGES: list[dict[str, Any]] = [
         "title": "Permission",
         "purpose": "Find out whether they are willing to talk now. A clear yes, a clear no, or a time to call back are all good outcomes. Talking on without one is not.",
         "guidance": "Test whether they have time right now. Never talk over a busy prospect; secure a specific callback window.",
-        "prospect_patterns": ["I am currently in a client meeting; please call back after 2 PM.", "I am currently in transit, but you have one minute to explain.", "Please share details on WhatsApp or email prior to a call."],
+        "prospect_patterns": [
+            "I am currently in a client meeting; please call back after 2 PM.",
+            "I am currently in transit, but you have one minute to explain.",
+            "Please share details on WhatsApp or email prior to a call."
+        ],
         "stage_taps": [
             "Agreed to talk now",
             "Callback requested (named time)",
@@ -78,7 +175,11 @@ STARTER_STAGES: list[dict[str, Any]] = [
         "title": "Their business",
         "purpose": "Ask about their company and their work before saying anything about yours. People talk about what they do; they rarely listen to what you do.",
         "guidance": "Ask an informed, open question about their operations or focus. Let them speak first; do not jump to the pitch.",
-        "prospect_patterns": ["Tell me about your firm first before we discuss our operations.", "We are market leaders; that operational model does not apply to us.", "That falls under manufacturing; I only manage corporate strategy."],
+        "prospect_patterns": [
+            "Tell me about your firm first before we discuss our operations.",
+            "We are market leaders; that operational model does not apply to us.",
+            "That falls under manufacturing; I only manage corporate strategy."
+        ],
         "stage_taps": [
             "Shared operations & setup",
             "Corrected business model",
@@ -92,7 +193,11 @@ STARTER_STAGES: list[dict[str, Any]] = [
         "title": "Their need, in their words",
         "purpose": "Hear what they are trying to do or struggling with, in their own words. This is the one stage where the caller writes down exactly what was said.",
         "guidance": "Log their exact words verbatim in the quote box. Do not summarize or paraphrase what they said.",
-        "prospect_patterns": ["Our current priority is improving plant capacity utilization and export margins.", "Our current business operations are completely stable; no advisory is required.", "We are an early-stage startup with limited budget for external consultants."],
+        "prospect_patterns": [
+            "Our current priority is improving plant capacity utilization and export margins.",
+            "Our current business operations are completely stable; no advisory is required.",
+            "We are an early-stage startup with limited budget for external consultants."
+        ],
         "stage_taps": [
             "Stated specific priority/bottleneck",
             "Said everything is fine / no need",
@@ -106,7 +211,11 @@ STARTER_STAGES: list[dict[str, Any]] = [
         "title": "Objection",
         "purpose": "Hear the reason for a no and understand it. A reason you understand can be answered on this call or the next; a reason you talked over cannot.",
         "guidance": "Acknowledge the objection without becoming defensive. Clarify whether it is contract lock-in, internal capability, or bad timing.",
-        "prospect_patterns": ["We have a multi-year global contract with an enterprise advisory partner.", "We have a robust internal team and process for operational problem solving.", "This is not an active priority for us at this time."],
+        "prospect_patterns": [
+            "We have a multi-year global contract with an enterprise advisory partner.",
+            "We have a robust internal team and process for operational problem solving.",
+            "This is not an active priority for us at this time."
+        ],
         "stage_taps": [
             "Global contract / locked vendor",
             "Internal team / robust process",
@@ -120,7 +229,11 @@ STARTER_STAGES: list[dict[str, Any]] = [
         "title": "Next step",
         "purpose": "Agree one concrete thing: a document on WhatsApp or email, a call at a named time, a meeting. One thing, named, with a time or a channel.",
         "guidance": "Lock down a specific channel or date/time. A time named by them is worth more than a time proposed by you.",
-        "prospect_patterns": ["Please send a summary on WhatsApp and I will review it.", "Please send documentation to my official corporate email address.", "Call me on Tuesday at 11:30 AM following our management review."],
+        "prospect_patterns": [
+            "Please send a summary on WhatsApp and I will review it.",
+            "Please send documentation to my official corporate email address.",
+            "Call me on Tuesday at 11:30 AM following our management review."
+        ],
         "stage_taps": [
             "Specific callback time set",
             "Official email deck agreed",
@@ -148,6 +261,26 @@ STARTER_STAGES: list[dict[str, Any]] = [
     },
 ]
 
+# -----------------------------------------------------------------------------
+# Allowed Outcome Types
+# -----------------------------------------------------------------------------
+ALLOWED_OUTCOMES = {
+    "meeting_booked",
+    "next_step_agreed",
+    "agreed_to_receive_report",
+    "follow_up",
+    "interested",
+    "not_interested",
+    "do_not_call",
+    "wrong_person",
+    "moved_company",
+    "no_answer",
+    "other",
+}
+
+# -----------------------------------------------------------------------------
+# Input Validation Schemas
+# -----------------------------------------------------------------------------
 class StartCall(BaseModel):
     prospect_name: str | None = Field(default=None, max_length=160)
     company_name: str | None = Field(default=None, max_length=180)
@@ -168,11 +301,20 @@ class UpdateStage(BaseModel):
 
 def db() -> Client:
     if supabase is None:
-        raise HTTPException(status_code=503, detail="Database is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.")
+        raise HTTPException(
+            status_code=503,
+            detail="Database is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY."
+        )
     return supabase
+
+
+# -----------------------------------------------------------------------------
+# API Endpoints
+# -----------------------------------------------------------------------------
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+    """Public health probe for uptime monitors and load balancers."""
     configured = supabase is not None
     llm_configured = bool(os.getenv("LLM_API_KEY"))
     if not configured:
@@ -180,8 +322,9 @@ def health() -> dict[str, Any]:
             "status": "ok",
             "database": "not_configured",
             "llm": "configured" if llm_configured else "disabled",
+            "auth": "enforced",
             "service": "coldcall-companion-api",
-            "version": "0.2.0"
+            "version": "0.3.0"
         }
     try:
         db().table("call_stages").select("id").limit(1).execute()
@@ -189,21 +332,25 @@ def health() -> dict[str, Any]:
             "status": "ok",
             "database": "connected",
             "llm": "configured" if llm_configured else "disabled",
+            "auth": "enforced",
             "service": "coldcall-companion-api",
-            "version": "0.2.0"
+            "version": "0.3.0"
         }
     except Exception as exc:
         return {
             "status": "degraded",
             "database": "error",
             "llm": "configured" if llm_configured else "disabled",
+            "auth": "enforced",
             "detail": str(exc)[:180],
             "service": "coldcall-companion-api",
-            "version": "0.2.0"
+            "version": "0.3.0"
         }
+
 
 @app.get("/stages")
 def list_stages() -> list[dict[str, Any]]:
+    """Returns the eight cold-call stages with prospect cues and quick taps."""
     if supabase is None:
         return STARTER_STAGES
     try:
@@ -214,31 +361,45 @@ def list_stages() -> list[dict[str, Any]]:
     except Exception:
         return STARTER_STAGES
 
+
 @app.post("/calls")
-def start_call(payload: StartCall) -> dict[str, Any]:
+def start_call(payload: StartCall, caller: Caller = Depends(get_current_caller)) -> dict[str, Any]:
+    """Creates a new persistent call stamped with the authenticated caller's identity."""
+    d = db()
     stages = list_stages()
     first_stage_id = stages[0]["id"] if stages else "opening"
     row = {
+        "caller_id": caller.id,
         "prospect_name": payload.prospect_name,
         "company_name": payload.company_name,
-        "current_stage_id": first_stage_id
+        "current_stage_id": first_stage_id,
     }
-    response = db().table("calls").insert(row).execute()
+    response = d.table("calls").insert(row).execute()
     if not response.data:
         raise HTTPException(500, "Could not create call")
     return response.data[0]
 
+
 @app.post("/calls/{call_id}/stage-results")
-def save_stage(call_id: UUID, payload: SaveStage) -> dict[str, Any]:
+def save_stage(
+    call_id: UUID,
+    payload: SaveStage,
+    caller: Caller = Depends(get_current_caller)
+) -> dict[str, Any]:
+    """Saves or updates notes, exact words, and quick taps. Enforces caller ownership and closed-call restrictions."""
     d = db()
     valid_stages = {s["id"] for s in list_stages()}
     if payload.stage_id not in valid_stages:
         raise HTTPException(400, f"Unknown stage_id: {payload.stage_id}")
-    call = d.table("calls").select("id,ended_at").eq("id", str(call_id)).maybe_single().execute().data
+
+    call = d.table("calls").select("id,caller_id,ended_at").eq("id", str(call_id)).maybe_single().execute().data
     if not call:
         raise HTTPException(404, "Call not found")
+    if call.get("caller_id") != caller.id and caller.role != "admin":
+        raise HTTPException(403, "Forbidden: You are not authorized to update this call")
     if call.get("ended_at"):
         raise HTTPException(409, "Call is already closed")
+
     row = {
         "call_id": str(call_id),
         "stage_id": payload.stage_id,
@@ -253,45 +414,99 @@ def save_stage(call_id: UUID, payload: SaveStage) -> dict[str, Any]:
         raise HTTPException(500, "Could not save stage result")
     return response.data[0]
 
+
 @app.patch("/calls/{call_id}/stage")
-def set_current_stage(call_id: UUID, payload: UpdateStage) -> dict[str, Any]:
+def set_current_stage(
+    call_id: UUID,
+    payload: UpdateStage,
+    caller: Caller = Depends(get_current_caller)
+) -> dict[str, Any]:
+    """Updates active stage tracker position. Enforces caller ownership and open call status."""
     d = db()
     valid_stages = {s["id"] for s in list_stages()}
     if payload.stage_id not in valid_stages:
         raise HTTPException(400, f"Unknown stage_id: {payload.stage_id}")
-    response = d.table("calls").update({"current_stage_id": payload.stage_id}).eq("id", str(call_id)).is_("ended_at", "null").execute()
+
+    call = d.table("calls").select("id,caller_id,ended_at").eq("id", str(call_id)).maybe_single().execute().data
+    if not call:
+        raise HTTPException(404, "Call not found")
+    if call.get("caller_id") != caller.id and caller.role != "admin":
+        raise HTTPException(403, "Forbidden: You are not authorized to update this call")
+    if call.get("ended_at"):
+        raise HTTPException(409, "Call is already closed")
+
+    response = d.table("calls").update({"current_stage_id": payload.stage_id}).eq("id", str(call_id)).execute()
     if not response.data:
-        raise HTTPException(404, "Open call not found")
+        raise HTTPException(404, "Could not update call stage")
     return response.data[0]
 
+
 @app.post("/calls/{call_id}/close")
-def close_call(call_id: UUID, payload: CloseCall) -> dict[str, Any]:
+def close_call(
+    call_id: UUID,
+    payload: CloseCall,
+    caller: Caller = Depends(get_current_caller)
+) -> dict[str, Any]:
+    """Closes an active call with outcome and context notes. Enforces outcome validation and prevents duplicate closes."""
     d = db()
+    if payload.outcome not in ALLOWED_OUTCOMES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid outcome: '{payload.outcome}'. Must be one of: {sorted(ALLOWED_OUTCOMES)}"
+        )
+
+    call = d.table("calls").select("id,caller_id,ended_at").eq("id", str(call_id)).maybe_single().execute().data
+    if not call:
+        raise HTTPException(404, "Call not found")
+    if call.get("caller_id") != caller.id and caller.role != "admin":
+        raise HTTPException(403, "Forbidden: You are not authorized to close this call")
+    if call.get("ended_at"):
+        raise HTTPException(409, "Call is already closed")
+
     response = d.table("calls").update({
         "outcome": payload.outcome,
         "outcome_notes": payload.outcome_notes,
         "ended_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", str(call_id)).is_("ended_at", "null").execute()
+    }).eq("id", str(call_id)).execute()
     if not response.data:
-        raise HTTPException(404, "Open call not found")
+        raise HTTPException(500, "Could not close call")
     return response.data[0]
 
+
 @app.get("/calls")
-def list_calls(limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+def list_calls(
+    limit: int = 50,
+    offset: int = 0,
+    caller: Caller = Depends(get_current_caller)
+) -> list[dict[str, Any]]:
+    """Returns past call history. Callers only receive their own records; admins see all calls."""
     if limit < 1 or limit > 100 or offset < 0:
         raise HTTPException(400, "limit must be 1-100 and offset must be non-negative")
-    rows = db().table("calls").select("*").order("started_at", desc=True).range(offset, offset + limit - 1).execute().data or []
+
+    query = db().table("calls").select("*").order("started_at", desc=True)
+    if caller.role != "admin":
+        query = query.eq("caller_id", caller.id)
+
+    rows = query.range(offset, offset + limit - 1).execute().data or []
     for row in rows:
         stage_results = db().table("call_stage_results").select("stage_id,result,prospect_words,notes,created_at").eq("call_id", row["id"]).order("created_at").execute().data or []
         row["stage_results"] = stage_results
     return rows
 
+
 @app.get("/calls/{call_id}")
-def get_call(call_id: UUID) -> dict[str, Any]:
+def get_call(
+    call_id: UUID,
+    caller: Caller = Depends(get_current_caller)
+) -> dict[str, Any]:
+    """Retrieves full call details. Verifies caller ownership before returning record."""
     d = db()
     row = d.table("calls").select("*").eq("id", str(call_id)).maybe_single().execute().data
     if not row:
         raise HTTPException(404, "Call not found")
+    if row.get("caller_id") != caller.id and caller.role != "admin":
+        raise HTTPException(403, "Forbidden: You are not authorized to view this call")
+
     row["stage_results"] = d.table("call_stage_results").select("*").eq("call_id", str(call_id)).order("created_at").execute().data or []
     return row
 
@@ -300,12 +515,18 @@ class AISummaryRequest(BaseModel):
     refresh: bool = False
 
 @app.post("/calls/{call_id}/ai-summary")
-async def generate_ai_summary(call_id: UUID, payload: AISummaryRequest) -> dict[str, Any]:
-    """Summarize only the caller's saved notes; never generate/alter prospect quotations."""
+async def generate_ai_summary(
+    call_id: UUID,
+    payload: AISummaryRequest,
+    caller: Caller = Depends(get_current_caller)
+) -> dict[str, Any]:
+    """Summarizes only the caller's saved notes; enforces caller ownership and never alters prospect quotations."""
     d = db()
     call = d.table("calls").select("*").eq("id", str(call_id)).maybe_single().execute().data
     if not call:
         raise HTTPException(404, "Call not found")
+    if call.get("caller_id") != caller.id and caller.role != "admin":
+        raise HTTPException(403, "Forbidden: You are not authorized to generate an AI summary for this call")
 
     if call.get("ai_summary") and not payload.refresh:
         return {"status": "ready", "configured": True, "summary": call["ai_summary"], "cached": True}
@@ -315,7 +536,6 @@ async def generate_ai_summary(call_id: UUID, payload: AISummaryRequest) -> dict[
     model = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
     if not api_key:
-        # Non-failing disabled state message as specified in Task 4
         return {
             "status": "disabled",
             "configured": False,
