@@ -8,8 +8,19 @@ import httpx
 from app import app, STARTER_STAGES
 import app as app_module
 
+# Explicit, high-entropy test tokens (never hardcoded in application runtime)
+VALID_CALLER_A_TOKEN = "alpha-secret-token-v884"
+VALID_CALLER_B_TOKEN = "beta-secret-token-x912"
+VALID_ADMIN_TOKEN = "admin-secret-token-z331"
+
+os.environ["CALLER_AUTH_TOKENS"] = (
+    f"rep-alpha:{VALID_CALLER_A_TOKEN},"
+    f"rep-beta:{VALID_CALLER_B_TOKEN},"
+    f"admin-lead:{VALID_ADMIN_TOKEN}:admin"
+)
+
 client = TestClient(app)
-client.headers.update({"Authorization": "Bearer fde-rep-101"})
+client.headers.update({"Authorization": f"Bearer {VALID_CALLER_A_TOKEN}"})
 
 
 # -----------------------------------------------------------------------------
@@ -594,9 +605,82 @@ def test_llm_failure_does_not_corrupt_call_data(mock_db, monkeypatch):
     assert stage_map["their_need"]["notes"] == "Very firm on in-house portal."
 
 
+# -----------------------------------------------------------------------------# Security & Authorization Tests (Authentication, Isolation, Validation)
 # -----------------------------------------------------------------------------
-# Security & Authorization Tests (Authentication, Isolation, Validation)
-# -----------------------------------------------------------------------------
+
+def test_prefix_tokens_are_strictly_rejected(mock_db):
+    test_client = TestClient(app)
+    """
+    REGRESSION TEST: Verify that prefix-based token bypasses are COMPLETELY eliminated.
+    Tokens starting with 'fde-', 'caller-', or 'admin-' MUST be rejected with 401.
+    """
+    prefix_bypass_attempts = [
+        "fde-rep-101",          # Previously hardcoded default
+        "fde-rep-102",
+        "fde-attacker",
+        "fde-anything",
+        "caller-rep",
+        "caller-attacker",
+        "caller-admin",
+        "admin-anything",        # Prefix escalation attempt
+        "admin-token-secret",    # Previously hardcoded default
+        "admin-root",
+        "admin-super",
+        "arbitrary-token-12345",
+        "Bearer",
+        "",
+    ]
+    for bad_token in prefix_bypass_attempts:
+        headers = {"Authorization": f"Bearer {bad_token}"} if bad_token else {}
+        res = test_client.get("/calls", headers=headers)
+        assert res.status_code == 401, f"Expected 401 for token '{bad_token}', got {res.status_code}"
+        assert "Authentication required" in res.json()["detail"] or "Invalid authentication token" in res.json()["detail"]
+
+
+def test_unconfigured_auth_fails_closed(mock_db, monkeypatch):
+    """
+    REGRESSION TEST: If CALLER_AUTH_TOKENS is empty or unset, server MUST fail closed (401),
+    never permitting fallback to unauthenticated access or hardcoded defaults.
+    """
+    monkeypatch.setenv("CALLER_AUTH_TOKENS", "")
+    res = client.get("/calls", headers={"Authorization": f"Bearer {VALID_CALLER_A_TOKEN}"})
+    assert res.status_code == 401
+    assert "Invalid authentication token" in res.json()["detail"]
+
+
+def test_admin_privilege_cannot_be_inferred_from_prefix(mock_db, monkeypatch):
+    """
+    REGRESSION TEST: Administrator privileges CANNOT be attained via 'admin-*' prefix.
+    Admin rights require an explicit ':admin' role configuration in CALLER_AUTH_TOKENS.
+    """
+    # 1. 'admin-impersonator' token is not in CALLER_AUTH_TOKENS -> 401
+    res_fake = client.get("/calls", headers={"Authorization": "Bearer admin-impersonator"})
+    assert res_fake.status_code == 401
+
+    # 2. Add a token with 'admin-' in the token string, but configured with default 'caller' role
+    monkeypatch.setenv(
+        "CALLER_AUTH_TOKENS",
+        f"caller-plain:admin-named-token,{os.environ['CALLER_AUTH_TOKENS']}"
+    )
+    # Caller A creates Call A
+    call_a = client.post("/calls", json={"prospect_name": "Target Co"}).json()
+
+    # The caller-plain user tries to access Call A -> 403 Forbidden (not an admin!)
+    res_forbidden = client.get(
+        f"/calls/{call_a['id']}",
+        headers={"Authorization": "Bearer admin-named-token"}
+    )
+    assert res_forbidden.status_code == 403
+    assert "Forbidden" in res_forbidden.json()["detail"]
+
+    # 3. Explicitly configured admin user CAN view Call A
+    res_admin = client.get(
+        f"/calls/{call_a['id']}",
+        headers={"Authorization": f"Bearer {VALID_ADMIN_TOKEN}"}
+    )
+    assert res_admin.status_code == 200
+    assert res_admin.json()["id"] == call_a["id"]
+
 
 def test_unauthenticated_requests_return_401(mock_db):
     unauthed_client = TestClient(app)  # No Authorization header
@@ -629,18 +713,13 @@ def test_unauthenticated_requests_return_401(mock_db):
     )
     assert res.status_code == 401
 
-    # 6. Invalid token returns 401
-    res = client.get("/calls", headers={"Authorization": "Bearer totally-invalid-token-xyz"})
-    assert res.status_code == 401
-    assert "Invalid authentication token" in res.json()["detail"]
-
 
 def test_unauthorized_cross_caller_access_returns_403(mock_db):
     caller_a_client = TestClient(app)
-    caller_a_client.headers.update({"Authorization": "Bearer fde-rep-101"})
+    caller_a_client.headers.update({"Authorization": f"Bearer {VALID_CALLER_A_TOKEN}"})
 
     caller_b_client = TestClient(app)
-    caller_b_client.headers.update({"Authorization": "Bearer fde-rep-102"})
+    caller_b_client.headers.update({"Authorization": f"Bearer {VALID_CALLER_B_TOKEN}"})
 
     # Caller A creates a call
     create_res = caller_a_client.post(
@@ -690,13 +769,13 @@ def test_unauthorized_cross_caller_access_returns_403(mock_db):
 
 def test_caller_history_isolation(mock_db):
     caller_a = TestClient(app)
-    caller_a.headers.update({"Authorization": "Bearer fde-rep-101"})
+    caller_a.headers.update({"Authorization": f"Bearer {VALID_CALLER_A_TOKEN}"})
 
     caller_b = TestClient(app)
-    caller_b.headers.update({"Authorization": "Bearer fde-rep-102"})
+    caller_b.headers.update({"Authorization": f"Bearer {VALID_CALLER_B_TOKEN}"})
 
     admin = TestClient(app)
-    admin.headers.update({"Authorization": "Bearer admin-token-secret"})
+    admin.headers.update({"Authorization": f"Bearer {VALID_ADMIN_TOKEN}"})
 
     # Caller A logs Call A
     caller_a.post("/calls", json={"prospect_name": "Alpha Corp Lead"})

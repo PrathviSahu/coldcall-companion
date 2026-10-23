@@ -164,9 +164,9 @@ const CALLER_TOKEN_KEY = 'sidecall_caller_token';
 
 function getCallerToken() {
   try {
-    return localStorage.getItem(CALLER_TOKEN_KEY) || 'fde-rep-101';
+    return (localStorage.getItem(CALLER_TOKEN_KEY) || '').trim();
   } catch {
-    return 'fde-rep-101';
+    return '';
   }
 }
 
@@ -187,7 +187,9 @@ async function request(path, options = {}) {
     clearTimeout(timeoutId);
     const body = await res.json().catch(() => ({}));
     if (!res.ok) {
-      throw new Error(body.detail || `Request failed (${res.status})`);
+      const err = new Error(body.detail || `Request failed (${res.status})`);
+      err.status = res.status;
+      throw err;
     }
     return body;
   } catch (err) {
@@ -241,6 +243,9 @@ function App() {
   const [outcomeNotes, setOutcomeNotes] = useState('');
   const [finishOpen, setFinishOpen] = useState(false);
   const [detailCall, setDetailCall] = useState(null);
+  const [callerToken, setCallerToken] = useState(getCallerToken());
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+  const [tokenInput, setTokenInput] = useState(getCallerToken());
 
   // Status & communication
   const [busy, setBusy] = useState(false);
@@ -340,7 +345,10 @@ function App() {
       );
       setHistory(sorted);
     } catch (err) {
-      if (localCalls.length > 0) {
+      if (err.status === 401) {
+        setHistoryError('Authentication required (401): Valid caller token is missing or unauthorized. Click Caller Profile in the topbar to enter your secret access token.');
+        setHistory([]);
+      } else if (localCalls.length > 0) {
         const localOnly = localCalls.map(c => ({ ...c, isLocal: true })).sort(
           (a, b) => new Date(b.started_at || 0) - new Date(a.started_at || 0)
         );
@@ -450,6 +458,14 @@ function App() {
   async function startCall(e) {
     e?.preventDefault();
     setError('');
+
+    const token = getCallerToken();
+    if (!token) {
+      setError('Authentication required: Please configure your caller token in Caller Profile before starting a call.');
+      setAuthModalOpen(true);
+      return;
+    }
+
     setBusy(true);
 
     const firstStage = stages[0] || STAGE_SEED[0];
@@ -473,7 +489,13 @@ function App() {
       });
       setActiveCall({ ...created, isLocal: false });
       setApiState('connected');
-    } catch {
+    } catch (err) {
+      if (err.status === 401) {
+        setError('Authentication failed (401): Caller token is invalid or unauthorized. Please click Caller Profile to enter a valid token.');
+        setAuthModalOpen(true);
+        setBusy(false);
+        return;
+      }
       setActiveCall(localCallRecord);
       setApiState('offline');
       setError('Backend unavailable. Call is running locally in this browser and will be stored securely in local memory.');
@@ -652,9 +674,18 @@ function App() {
                 </>
               )}
             </div>
-            <div className="avatar" title={`Caller: ${getCallerToken()} (Role: caller)`}>
-              FDE
-            </div>
+            <button
+              type="button"
+              className={`avatar ${callerToken ? 'authed' : 'unauthed'}`}
+              title={callerToken ? `Caller Token Configured (${callerToken.slice(0, 3)}•••). Click to change.` : 'No caller token configured! Click to authenticate.'}
+              onClick={() => {
+                setTokenInput(getCallerToken());
+                setAuthModalOpen(true);
+              }}
+              aria-label="Caller Profile and Authentication"
+            >
+              {callerToken ? 'FDE' : '!'}
+            </button>
           </div>
         </header>
 
@@ -1354,6 +1385,84 @@ function App() {
                 disabled={busy}
               >
                 <span>{busy ? 'Saving…' : 'Save and close call'}</span>
+                <Check size={16} />
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {/* CALLER AUTHENTICATION & ACCESS TOKEN MODAL */}
+      {authModalOpen && (
+        <div
+          className="modal-backdrop"
+          onMouseDown={e => {
+            if (e.target === e.currentTarget) setAuthModalOpen(false);
+          }}
+        >
+          <section className="finish-modal auth-modal" role="dialog" aria-modal="true">
+            <div className="modal-icon">
+              <Shield size={19} />
+            </div>
+            <button
+              className="modal-close"
+              type="button"
+              onClick={() => setAuthModalOpen(false)}
+              aria-label="Close modal"
+            >
+              <X size={17} />
+            </button>
+
+            <div className="eyebrow">CALLER AUTHENTICATION</div>
+            <h2>Caller Access Token</h2>
+            <p>
+              Enter the secret Bearer token configured in your server environment (<code>CALLER_AUTH_TOKENS</code>). Call records and history are strictly isolated to your verified identity.
+            </p>
+
+            <label className="textarea-label" htmlFor="modal-auth-token-input">
+              BEARER TOKEN <span>REQUIRED</span>
+            </label>
+            <input
+              id="modal-auth-token-input"
+              type="password"
+              className="extra-input token-input"
+              value={tokenInput}
+              onChange={e => setTokenInput(e.target.value)}
+              placeholder="e.g. paste-your-secret-caller-token"
+              autoComplete="off"
+            />
+
+            <div className="modal-footer">
+              <button
+                className="quiet-button"
+                type="button"
+                onClick={() => {
+                  localStorage.removeItem(CALLER_TOKEN_KEY);
+                  setCallerToken('');
+                  setTokenInput('');
+                  setAuthModalOpen(false);
+                  loadHistory();
+                }}
+              >
+                Clear Token
+              </button>
+              <button
+                className="primary-button"
+                type="button"
+                onClick={() => {
+                  const clean = tokenInput.trim();
+                  if (clean) {
+                    localStorage.setItem(CALLER_TOKEN_KEY, clean);
+                    setCallerToken(clean);
+                    setError('');
+                    setHistoryError('');
+                    setAuthModalOpen(false);
+                    loadHistory();
+                  }
+                }}
+                disabled={!tokenInput.trim()}
+              >
+                <span>Save Token</span>
                 <Check size={16} />
               </button>
             </div>

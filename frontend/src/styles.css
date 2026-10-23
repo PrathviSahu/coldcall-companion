@@ -2552,3 +2552,29 @@ button:disabled {
     grid-template-columns: 1fr;
   }
 }
+
+/* ── Caller Auth & Token Input ── */
+.avatar.unauthed {
+  background: #fdf2f2;
+  border-color: #fca5a5;
+  color: #b91c1c;
+  font-size: 14px;
+  font-weight: 900;
+  animation: lcPulse 2s infinite;
+}
+.token-input {
+  width: 100%;
+  padding: 12px 14px;
+  background: #faf9f5;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--ink);
+  margin-top: 6px;
+}
+.token-input:focus {
+  outline: none;
+  border-color: var(--green);
+  background: #ffffff;
+}

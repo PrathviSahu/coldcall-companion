@@ -55,37 +55,39 @@ def parse_auth_tokens() -> dict[str, Caller]:
     """
     Parses configured tokens from environment variable CALLER_AUTH_TOKENS.
     Format: comma-separated list of entries:
-      - token_string (defaults to caller_id matching token)
-      - caller_id:token_string
-      - caller_id:token_string:role
-    Defaults to known secure dev/testing tokens when not explicitly set.
+      - caller_id:token (role defaults to 'caller')
+      - caller_id:token:role (e.g. ops_lead:strong_secret_token_123:admin)
+    Fails closed: returns an empty mapping if CALLER_AUTH_TOKENS is unset or empty.
+    Never injects hardcoded default credentials or wildcard tokens.
     """
-    raw = os.getenv("CALLER_AUTH_TOKENS")
+    raw = os.getenv("CALLER_AUTH_TOKENS", "").strip()
     mapping: dict[str, Caller] = {}
-    if raw:
-        for entry in raw.split(","):
-            parts = [p.strip() for p in entry.split(":") if p.strip()]
-            if len(parts) == 1:
-                token = parts[0]
-                mapping[token] = Caller(id=token, name=f"Caller {token}", role="caller")
-            elif len(parts) == 2:
-                cid, token = parts
-                mapping[token] = Caller(id=cid, name=f"Caller {cid}", role="caller")
-            elif len(parts) >= 3:
-                cid, token, role = parts[:3]
-                mapping[token] = Caller(id=cid, name=f"Caller {cid}", role=role)
-    else:
-        # Standard development tokens
-        mapping["fde-rep-101"] = Caller(id="fde-rep-101", name="FDE Rep 101", role="caller")
-        mapping["fde-rep-102"] = Caller(id="fde-rep-102", name="FDE Rep 102", role="caller")
-        mapping["admin-token-secret"] = Caller(id="admin", name="Operations Lead", role="admin")
+    if not raw:
+        return mapping
+
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = [p.strip() for p in entry.split(":") if p.strip()]
+        if len(parts) == 2:
+            cid, token = parts
+            mapping[token] = Caller(id=cid, name=f"Caller {cid}", role="caller")
+        elif len(parts) >= 3:
+            cid, token, role = parts[:3]
+            clean_role = "admin" if role.lower() == "admin" else "caller"
+            mapping[token] = Caller(id=cid, name=f"Caller {cid}", role=clean_role)
     return mapping
 
 
 def get_current_caller(
     credentials: HTTPAuthorizationCredentials | None = Security(security_bearer),
 ) -> Caller:
-    """Enforces authentication for call data operations. Returns the authenticated Caller."""
+    """
+    Enforces authentication for call data operations. Returns the authenticated Caller.
+    Strictly verifies token against configured CALLER_AUTH_TOKENS.
+    No prefix inference, no dynamic fallbacks, no hardcoded defaults.
+    """
     if not credentials or not credentials.credentials:
         raise HTTPException(
             status_code=401,
@@ -96,16 +98,10 @@ def get_current_caller(
     auth_tokens = parse_auth_tokens()
     caller = auth_tokens.get(token)
 
-    # Allow dynamic caller tokens prefixed with 'fde-' or 'caller-' for testing suites
-    if not caller and (token.startswith("caller-") or token.startswith("fde-")):
-        caller = Caller(id=token, name=f"Caller {token}", role="caller")
-    elif not caller and token.startswith("admin-"):
-        caller = Caller(id=token, name="Admin Caller", role="admin")
-
     if not caller:
         raise HTTPException(
             status_code=401,
-            detail="Invalid authentication token",
+            detail="Invalid authentication token: Access denied",
             headers={"WWW-Authenticate": "Bearer"},
         )
     return caller
