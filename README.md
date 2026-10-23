@@ -2,6 +2,8 @@
 
 A focused, editorial live-call side screen for outbound callers reaching Indian business leaders. Follow the eight proven call stages, anticipate authentic prospect responses derived from 100 empirical transcripts, log single-tap outcomes and exact verbatim prospect words, and review completed and abandoned calls.
 
+- **GitHub Repository**: [https://github.com/PrathviSahu/coldcall-companion](https://github.com/PrathviSahu/coldcall-companion)
+
 ---
 
 ## Live System & Architecture
