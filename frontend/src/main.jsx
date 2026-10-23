@@ -250,6 +250,8 @@ function App() {
   // Status & communication
   const [busy, setBusy] = useState(false);
   const [savingStage, setSavingStage] = useState(false);
+  const [syncError, setSyncError] = useState('');
+  const [hasUnsyncedStage, setHasUnsyncedStage] = useState(false);
   const [error, setError] = useState('');
   const [apiState, setApiState] = useState('checking'); // 'connected' | 'local' | 'offline' | 'checking'
   const [aiBusy, setAiBusy] = useState(false);
@@ -379,6 +381,7 @@ function App() {
 
     setSavingStage(true);
 
+    let syncSucceeded = false;
     // Sync to backend if activeCall is a server-backed call
     if (!call.isLocal) {
       try {
@@ -391,10 +394,18 @@ function App() {
             notes: notesToSave || '',
           }),
         });
+        syncSucceeded = true;
+        setSyncError('');
+        setHasUnsyncedStage(false);
       } catch (e) {
-        console.warn('Backend sync failed, storing locally:', e.message);
+        console.warn('Backend stage sync failed, draft preserved locally:', e.message);
+        setSyncError(`Stage draft saved locally. Cloud sync pending: ${e.message}`);
+        setHasUnsyncedStage(true);
       }
+    } else {
+      syncSucceeded = true;
     }
+    stagePayload.synced = syncSucceeded;
 
     // Update local state map
     const updated = {
@@ -802,6 +813,10 @@ function App() {
                       <span className="lc-conn-badge lc-conn-local">
                         <span className="lc-conn-dot lc-conn-dot--local" /> LOCAL ONLY
                       </span>
+                    ) : (hasUnsyncedStage || syncError) ? (
+                      <span className="lc-conn-badge lc-conn-pending" title="Draft saved locally; cloud sync pending">
+                        <span className="lc-conn-dot lc-conn-dot--pending" /> PENDING SYNC
+                      </span>
                     ) : apiState === 'connected' ? (
                       <span className="lc-conn-badge lc-conn-synced">
                         <span className="lc-conn-dot lc-conn-dot--synced" /> SYNCED
@@ -860,19 +875,14 @@ function App() {
                       )}
                     </div>
 
-                    <div className="lc-section-label">THEY MAY SAY</div>
+                    <div className="lc-section-label lc-section-label--flex">
+                      <span>THEY MAY SAY</span>
+                      <span className="lc-cues-tag">OBSERVED CUES (READ-ONLY)</span>
+                    </div>
                     <div className="lc-cues-list">
                       {(stage.prospect_patterns || []).map((pat, idx) => (
-                        <div className="lc-cue-row" key={idx}>
-                          <span>{pat}</span>
-                          <button
-                            type="button"
-                            className="lc-cue-append"
-                            title="Append to prospect's words"
-                            onClick={() => setWords(w => w ? w + ' ' + pat : pat)}
-                          >
-                            +
-                          </button>
+                        <div className="lc-cue-row lc-cue-row--readonly" key={idx}>
+                          <span className="lc-cue-text">{pat}</span>
                         </div>
                       ))}
                     </div>
@@ -897,6 +907,25 @@ function App() {
                     {savingStage && (
                       <div className="lc-saving-bar">
                         <RefreshCw size={11} className="spin-icon" /> Saving stage…
+                      </div>
+                    )}
+
+                    {syncError && (
+                      <div className="lc-unsynced-banner" role="alert">
+                        <div className="lc-unsynced-content">
+                          <span className="lc-unsynced-dot" />
+                          <span>{syncError}</span>
+                        </div>
+                        <button
+                          type="button"
+                          className="lc-retry-sync-btn"
+                          onClick={() => performSaveStage(words, notes, selectedTap)}
+                          disabled={savingStage}
+                          title="Retry syncing this stage draft to cloud"
+                        >
+                          <RefreshCw size={11} className={savingStage ? 'spin-icon' : ''} />
+                          {savingStage ? 'Syncing…' : 'Retry Cloud Sync'}
+                        </button>
                       </div>
                     )}
 

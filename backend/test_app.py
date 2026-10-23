@@ -855,3 +855,106 @@ def test_real_supabase_live_connectivity_check():
     live_client = create_client(url, key)
     stages = live_client.table("call_stages").select("id,position,title").order("position").execute()
     assert len(stages.data) == 8, f"Expected 8 stages in live Supabase, got {len(stages.data)}"
+
+
+def test_sample_patterns_are_strictly_isolated_from_prospect_words(mock_db):
+    """
+    REGRESSION TEST: Verify that behavioral sample patterns (prospect_patterns)
+    are strictly read-only cues and are NEVER injected or saved into prospect_words
+    without explicit caller entry.
+    """
+    # 1. Verify stages return prospect_patterns as guidance
+    stages = client.get("/stages").json()
+    stage_5 = next(s for s in stages if s["id"] == "their_need")
+    assert len(stage_5["prospect_patterns"]) >= 3
+    sample_pattern = stage_5["prospect_patterns"][0]
+
+    # 2. Start a call
+    call = client.post("/calls", json={"prospect_name": "Quotation Integrity Test"}).json()
+    call_id = call["id"]
+
+    # 3. Caller saves stage 5 with explicit caller quote
+    explicit_caller_quote = "Prospect said: 'We are expanding to Gujarat next quarter.'"
+    client.post(
+        f"/calls/{call_id}/stage-results",
+        json={
+            "stage_id": "their_need",
+            "result": "Stated specific priority/bottleneck",
+            "prospect_words": explicit_caller_quote,
+            "notes": "Verified caller input.",
+        },
+    )
+
+    # 4. Verify that prospect_words ONLY contains explicit caller input, never sample pattern
+    detail = client.get(f"/calls/{call_id}").json()
+    s5_record = next(r for r in detail["stage_results"] if r["stage_id"] == "their_need")
+    assert s5_record["prospect_words"] == explicit_caller_quote
+    assert sample_pattern not in s5_record["prospect_words"]
+
+
+def test_stage_save_retry_and_reconciliation(mock_db):
+    """
+    REGRESSION TEST: Verify that repeated saves / retries for the same (call_id, stage_id)
+    perform an idempotent upsert, reconciling newer notes without creating duplicate records.
+    """
+    call = client.post("/calls", json={"prospect_name": "Reconciliation Prospect"}).json()
+    call_id = call["id"]
+
+    # First attempt: Draft notes saved
+    res1 = client.post(
+        f"/calls/{call_id}/stage-results",
+        json={
+            "stage_id": "opening",
+            "result": "Reached right person",
+            "prospect_words": "",
+            "notes": "Initial draft note taken during first 10 seconds",
+        },
+    )
+    assert res1.status_code == 200
+
+    # Second attempt: Caller edits/updates notes during same stage
+    res2 = client.post(
+        f"/calls/{call_id}/stage-results",
+        json={
+            "stage_id": "opening",
+            "result": "Reached right person",
+            "prospect_words": "",
+            "notes": "Reconciled note: confirmed VP Operations direct line",
+        },
+    )
+    assert res2.status_code == 200
+
+    # Verify that call_detail only has ONE stage result for 'opening' with latest reconciled notes
+    detail = client.get(f"/calls/{call_id}").json()
+    opening_records = [r for r in detail["stage_results"] if r["stage_id"] == "opening"]
+    assert len(opening_records) == 1
+    assert opening_records[0]["notes"] == "Reconciled note: confirmed VP Operations direct line"
+
+
+def test_admin_can_filter_calls_by_caller_id(mock_db):
+    """
+    REGRESSION TEST: Verify that an administrator can query /calls with a specific
+    caller_id parameter, enabling audit of specific sales reps or legacy records.
+    """
+    admin = TestClient(app)
+    admin.headers.update({"Authorization": f"Bearer {VALID_ADMIN_TOKEN}"})
+
+    rep_a = TestClient(app)
+    rep_a.headers.update({"Authorization": f"Bearer {VALID_CALLER_A_TOKEN}"})
+
+    rep_b = TestClient(app)
+    rep_b.headers.update({"Authorization": f"Bearer {VALID_CALLER_B_TOKEN}"})
+
+    # Log calls
+    c_a = rep_a.post("/calls", json={"prospect_name": "Rep Alpha Deal"}).json()
+    c_b = rep_b.post("/calls", json={"prospect_name": "Rep Beta Deal"}).json()
+
+    # Admin filters by rep-alpha
+    res_a = admin.get("/calls?caller_id=rep-alpha").json()
+    assert any(c["id"] == c_a["id"] for c in res_a)
+    assert not any(c["id"] == c_b["id"] for c in res_a)
+
+    # Admin filters by rep-beta
+    res_b = admin.get("/calls?caller_id=rep-beta").json()
+    assert any(c["id"] == c_b["id"] for c in res_b)
+    assert not any(c["id"] == c_a["id"] for c in res_b)

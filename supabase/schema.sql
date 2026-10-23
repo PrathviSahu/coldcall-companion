@@ -42,6 +42,21 @@ alter table public.calls add column if not exists caller_id text not null defaul
 alter table public.calls add column if not exists ai_summary jsonb;
 
 -- -----------------------------------------------------------------------------
+-- Legacy Record Migration & Ownership Reassignment Procedure
+-- -----------------------------------------------------------------------------
+-- Pre-existing calls created before authentication was introduced received
+-- caller_id = 'anonymous-caller'.
+-- Under caller-isolation rules, 'anonymous-caller' records are hidden from standard
+-- sales reps and are only visible to administrators (role='admin').
+-- To safely reassign legacy calls to a specific sales rep without data loss, run:
+--
+--   UPDATE public.calls
+--   SET caller_id = 'target_rep_caller_id'
+--   WHERE caller_id = 'anonymous-caller';
+--
+-- NEVER run DELETE statements on legacy calls.
+
+-- -----------------------------------------------------------------------------
 -- 3. Stage Results Table (Idempotent Upsert on call_id, stage_id)
 -- -----------------------------------------------------------------------------
 create table if not exists public.call_stage_results (

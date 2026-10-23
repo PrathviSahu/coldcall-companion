@@ -2578,3 +2578,92 @@ button:disabled {
   border-color: var(--green);
   background: #ffffff;
 }
+
+/* ── Unsynced Banner, Retry Sync, and Pending Connection Badge ── */
+.lc-conn-pending {
+  background: #fef9ee;
+  color: #926914;
+  border-color: #f7e3af;
+}
+
+.lc-conn-dot--pending {
+  background: #c7a75c;
+  animation: lcPulse 1.5s infinite;
+}
+
+.lc-section-label--flex {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.lc-cues-tag {
+  font-size: 9.5px;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: 0.06em;
+}
+
+.lc-cue-row--readonly {
+  background: #faf9f5;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 9px 12px;
+  font-size: 13px;
+  color: #4b5246;
+  line-height: 1.45;
+  font-style: italic;
+  user-select: text;
+}
+
+.lc-unsynced-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: #fffbf0;
+  border: 1px solid #fce8b3;
+  border-radius: 4px;
+  padding: 10px 14px;
+  margin-top: 14px;
+}
+
+.lc-unsynced-content {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #8c6812;
+  font-weight: 500;
+}
+
+.lc-unsynced-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #c7a75c;
+  flex-shrink: 0;
+  animation: lcPulse 1.5s infinite;
+}
+
+.lc-retry-sync-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #ffffff;
+  border: 1px solid #d9bd77;
+  border-radius: 3px;
+  padding: 5px 10px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: #8c6812;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  flex-shrink: 0;
+}
+
+.lc-retry-sync-btn:hover:not(:disabled) {
+  background: #fdf5df;
+  border-color: #8c6812;
+}

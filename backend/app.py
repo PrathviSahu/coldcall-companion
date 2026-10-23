@@ -473,14 +473,18 @@ def close_call(
 def list_calls(
     limit: int = 50,
     offset: int = 0,
+    caller_id: str | None = None,
     caller: Caller = Depends(get_current_caller)
 ) -> list[dict[str, Any]]:
-    """Returns past call history. Callers only receive their own records; admins see all calls."""
+    """Returns past call history. Callers only receive their own records; admins can inspect all or filter by caller_id."""
     if limit < 1 or limit > 100 or offset < 0:
         raise HTTPException(400, "limit must be 1-100 and offset must be non-negative")
 
     query = db().table("calls").select("*").order("started_at", desc=True)
-    if caller.role != "admin":
+    if caller.role == "admin":
+        if caller_id:
+            query = query.eq("caller_id", caller_id)
+    else:
         query = query.eq("caller_id", caller.id)
 
     rows = query.range(offset, offset + limit - 1).execute().data or []

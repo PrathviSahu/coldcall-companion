@@ -45,12 +45,19 @@ Derived directly from the DeepThought cold-call structure guidelines and empiric
    - The LLM runs server-side only; API keys are never exposed in the client bundle.
    - If `LLM_API_KEY` is unset, the endpoint returns a non-failing disabled-state message rather than throwing errors.
    - Raw notes remain untouched; the AI only surfaces review metadata (summary, objection category, signals, follow-ups, gaps).
-5. **Caller Authentication, Authorization & Isolation**:
-   - Every call-specific API endpoint (`POST /calls`, `POST /calls/{id}/stage-results`, `PATCH /calls/{id}/stage`, `POST /calls/{id}/close`, `GET /calls`, `GET /calls/{id}`, `POST /calls/{id}/ai-summary`) enforces Bearer token authentication via `get_current_caller`. Unauthenticated requests return `401 Unauthorized`.
-   - **Cross-Caller Isolation**: Callers only access calls they created. Attempts to read, edit, or close another caller's call return `403 Forbidden`. Call history (`GET /calls`) filters strictly by `caller_id`.
-   - **Outcome Validation**: Final outcomes are strictly checked against `ALLOWED_OUTCOMES` (returning `422 Unprocessable Entity` on unrecognized values).
-   - **Closed Call Immutability**: Modifying or re-closing an ended conversation returns `409 Conflict`.
-   - **Supabase RLS Policies**: `supabase/schema.sql` enables RLS on all tables with explicit caller isolation policies (`auth.uid() = caller_id`), ensuring data protection at the database engine level.
+5. **Caller Authentication, Authorization & Interim Access Model**:
+   - **Interim Internal Model**: Authentication uses server-configured static bearer tokens via `CALLER_AUTH_TOKENS`. This is an interim internal access model designed for operational sales reps, not a full OAuth/session-expiring system. Generate high-entropy tokens per caller (e.g. `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`) and keep them strictly out of source control.
+   - **Fail-Closed Security**: If `CALLER_AUTH_TOKENS` is unconfigured, all authenticated endpoints fail closed (401 Unauthorized). Prefix-based token bypasses (`fde-*`, `caller-*`, `admin-*`) are strictly disallowed. Administrator status requires an explicit `:admin` token configuration.
+   - **Cross-Caller Isolation**: Reps only access calls they created; unauthorized cross-caller access returns `403 Forbidden`. Call history (`GET /calls`) filters strictly by `caller_id`, while administrators can query all calls or filter by specific reps via `?caller_id=...`.
+   - **Outcome Validation & Immutability**: Outcomes are validated against `ALLOWED_OUTCOMES` (422 on invalid input), and closed calls cannot be modified (409 Conflict).
+   - **Supabase Defense-in-Depth**: `supabase/schema.sql` includes RLS policies (`auth.uid() = caller_id`). In backend service-role architecture, the FastAPI application layer enforces authoritative isolation boundaries.
+6. **Quotation Integrity (Read-Only Sample Patterns)**:
+   - Behavioral cues (`prospect_patterns`) derived from transcript analysis are presented as read-only situational cues (`OBSERVED CUES (READ-ONLY)`).
+   - The UI does not provide auto-append buttons into verbatim fields. Actual prospect quotes must be explicitly typed by the caller to ensure synthetic phrases never pollute compliance records.
+7. **Failed Stage Save Recovery & Reconciliation**:
+   - If backend stage persistence encounters network interruption or a 5xx error, the local draft is preserved in state.
+   - The UI displays an amber `PENDING SYNC` status badge and an alert banner with a `Retry Cloud Sync` action.
+   - Retries perform an idempotent upsert (`on_conflict="call_id,stage_id"`), reconciling server state with the caller's latest edits without creating duplicate records or overwriting newer drafts.
 
 ---
 
@@ -65,6 +72,15 @@ Derived directly from the DeepThought cold-call structure guidelines and empiric
    - `public.call_stage_results` (with composite unique key on `call_id, stage_id`)
    - Indexes and Row Level Security policies.
    The script is fully idempotent (`ON CONFLICT (id) DO UPDATE`).
+
+4. **Legacy Record Reassignment (Optional)**:
+   Pre-existing call records created prior to caller authentication have `caller_id = 'anonymous-caller'`. Under strict isolation, regular sales reps will not see these records; only administrators (configured with `:admin` role) have visibility.
+   To safely reassign legacy calls to an active rep without deleting any call history, execute the following SQL in Supabase:
+   ```sql
+   UPDATE public.calls
+   SET caller_id = 'YOUR_REP_ID'
+   WHERE caller_id = 'anonymous-caller';
+   ```
 
 ### 2. Backend (FastAPI)
 ```bash
@@ -103,6 +119,7 @@ VITE_API_BASE_URL=http://localhost:8000
 ```env
 SUPABASE_URL=https://YOUR_PROJECT.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=YOUR_SERVER_ONLY_KEY
+CALLER_AUTH_TOKENS=rep-alpha:strong-token-alpha,rep-beta:strong-token-beta,admin-lead:strong-admin-token:admin
 LLM_API_KEY=YOUR_SERVER_ONLY_LLM_KEY
 LLM_API_URL=https://api.openai.com/v1/chat/completions
 LLM_MODEL=gpt-4o-mini
@@ -122,6 +139,7 @@ CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
 6. Add Environment Variables:
    - `SUPABASE_URL`: Your Supabase project URL (`https://your-id.supabase.co`)
    - `SUPABASE_SERVICE_ROLE_KEY`: Your server-only service-role key
+   - `CALLER_AUTH_TOKENS`: e.g. `rep-alpha:token1,rep-beta:token2,admin-lead:token3:admin` (generated securely, kept out of git)
    - `LLM_API_KEY`: Your LLM provider API key
    - `LLM_MODEL`: e.g. `gpt-4o-mini`
    - `CORS_ORIGINS`: Your Vercel frontend URL (or `*` during initial staging)
