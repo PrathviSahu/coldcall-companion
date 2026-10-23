@@ -2,11 +2,13 @@ import React, { useEffect, useMemo, useState, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   Activity,
+  AlertTriangle,
   ArrowLeft,
   ArrowRight,
   Check,
   ChevronRight,
   Clock3,
+  CloudOff,
   FileText,
   Headphones,
   History,
@@ -256,6 +258,10 @@ function App() {
   const [apiState, setApiState] = useState('checking'); // 'connected' | 'local' | 'offline' | 'checking'
   const [aiBusy, setAiBusy] = useState(false);
   const [aiNotice, setAiNotice] = useState('');
+  const [closeError, setCloseError] = useState('');
+  const [closeOfflineConfirm, setCloseOfflineConfirm] = useState(false);
+  const [syncingCallId, setSyncingCallId] = useState(null);
+  const [syncingAllOffline, setSyncingAllOffline] = useState(false);
 
   // Keep refs to avoid stale closure races during atomic transitions
   const activeCallRef = useRef(activeCall);
@@ -363,6 +369,32 @@ function App() {
     }
   }
 
+  // Evaluates unsynced status across all stages in stageResults
+  function evaluateUnsyncedState(resultsMap, call) {
+    if (!call) {
+      setHasUnsyncedStage(false);
+      setSyncError('');
+      return false;
+    }
+    const stageItems = Object.values(resultsMap || {});
+    const unsyncedList = stageItems.filter(s => s && s.synced === false);
+
+    if (call.isLocal) {
+      setHasUnsyncedStage(true);
+      setSyncError('Call running in offline mode. Notes saved locally; cloud sync pending.');
+      return true;
+    } else if (unsyncedList.length > 0) {
+      setHasUnsyncedStage(true);
+      const stageNames = unsyncedList.map(s => s.stage_id).join(', ');
+      setSyncError(`${unsyncedList.length} stage record(s) pending cloud sync (${stageNames}).`);
+      return true;
+    } else {
+      setHasUnsyncedStage(false);
+      setSyncError('');
+      return false;
+    }
+  }
+
   // Safe persistence worker that saves current stage data and returns updated results map
   async function performSaveStage(wordsToSave, notesToSave, tapToSave, targetStageId = null) {
     const call = activeCallRef.current;
@@ -377,12 +409,13 @@ function App() {
       prospect_words: wordsToSave || '',
       notes: notesToSave || '',
       updated_at: new Date().toISOString(),
+      synced: false,
+      sync_error: null,
     };
 
     setSavingStage(true);
 
     let syncSucceeded = false;
-    // Sync to backend if activeCall is a server-backed call
     if (!call.isLocal) {
       try {
         await request(`/calls/${call.id}/stage-results`, {
@@ -395,15 +428,10 @@ function App() {
           }),
         });
         syncSucceeded = true;
-        setSyncError('');
-        setHasUnsyncedStage(false);
       } catch (e) {
         console.warn('Backend stage sync failed, draft preserved locally:', e.message);
-        setSyncError(`Stage draft saved locally. Cloud sync pending: ${e.message}`);
-        setHasUnsyncedStage(true);
+        stagePayload.sync_error = e.message;
       }
-    } else {
-      syncSucceeded = true;
     }
     stagePayload.synced = syncSucceeded;
 
@@ -415,7 +443,10 @@ function App() {
     stageResultsRef.current = updated;
     setStageResults(updated);
 
-    // Always mirror to localStorage
+    // Re-evaluate unsynced status across all stages
+    evaluateUnsyncedState(updated, call);
+
+    // Mirror to localStorage
     try {
       const existingHistory = JSON.parse(localStorage.getItem('sidecall-history') || '[]');
       const updatedRecord = {
@@ -431,6 +462,91 @@ function App() {
 
     setSavingStage(false);
     return updated;
+  }
+
+  // Retries syncing ALL pending records (provisions call on server if offline, then syncs every unsynced stage)
+  async function retrySyncAllPending() {
+    const call = activeCallRef.current;
+    if (!call) return true;
+    setSavingStage(true);
+    setSyncError('');
+
+    let currentCall = call;
+
+    // 1. If call was created offline, first establish persistent call on server
+    if (currentCall.isLocal) {
+      try {
+        const created = await request('/calls', {
+          method: 'POST',
+          body: JSON.stringify({
+            prospect_name: currentCall.prospect_name?.trim() || null,
+            company_name: currentCall.company_name?.trim() || null,
+            started_at: currentCall.started_at || new Date().toISOString(),
+          }),
+        });
+        currentCall = { ...created, isLocal: false };
+        activeCallRef.current = currentCall;
+        setActiveCall(currentCall);
+        setApiState('connected');
+      } catch (e) {
+        setSavingStage(false);
+        setSyncError(`Could not establish server call: ${e.message}. Draft preserved locally.`);
+        setHasUnsyncedStage(true);
+        return false;
+      }
+    }
+
+    // 2. Retry every stage in stageResults where synced !== true
+    const currentResults = { ...stageResultsRef.current };
+    const stageEntries = Object.entries(currentResults);
+
+    for (const [stId, sData] of stageEntries) {
+      if (sData.synced !== true) {
+        try {
+          await request(`/calls/${currentCall.id}/stage-results`, {
+            method: 'POST',
+            body: JSON.stringify({
+              stage_id: stId,
+              result: sData.result || 'completed',
+              prospect_words: sData.prospect_words || '',
+              notes: sData.notes || '',
+            }),
+          });
+          currentResults[stId] = {
+            ...sData,
+            synced: true,
+            sync_error: null,
+          };
+        } catch (e) {
+          currentResults[stId] = {
+            ...sData,
+            synced: false,
+            sync_error: e.message,
+          };
+        }
+      }
+    }
+
+    stageResultsRef.current = currentResults;
+    setStageResults(currentResults);
+
+    // Mirror updated state to localStorage
+    try {
+      const existingHistory = JSON.parse(localStorage.getItem('sidecall-history') || '[]');
+      const updatedRecord = {
+        ...currentCall,
+        current_stage_id: stage?.id || currentCall.current_stage_id,
+        stage_results: Object.values(currentResults),
+      };
+      const filtered = existingHistory.filter(c => c.id !== currentCall.id && c.id !== call.id);
+      localStorage.setItem('sidecall-history', JSON.stringify([updatedRecord, ...filtered]));
+    } catch (e) {
+      console.warn('LocalStorage write failed:', e);
+    }
+
+    const stillUnsynced = evaluateUnsyncedState(currentResults, currentCall);
+    setSavingStage(false);
+    return !stillUnsynced;
   }
 
   // Atomic transition: strictly awaits save of active stage BEFORE switching
@@ -488,6 +604,7 @@ function App() {
       current_stage_id: firstStage.id,
       stage_results: [],
       isLocal: true,
+      sync_status: 'unsynced',
     };
 
     try {
@@ -500,6 +617,8 @@ function App() {
       });
       setActiveCall({ ...created, isLocal: false });
       setApiState('connected');
+      setHasUnsyncedStage(false);
+      setSyncError('');
     } catch (err) {
       if (err.status === 401) {
         setError('Authentication failed (401): Caller token is invalid or unauthorized. Please click Caller Profile to enter a valid token.');
@@ -509,6 +628,8 @@ function App() {
       }
       setActiveCall(localCallRecord);
       setApiState('offline');
+      setHasUnsyncedStage(true);
+      setSyncError('Backend unavailable. Call running in offline mode. Notes will be preserved in browser memory.');
       setError('Backend unavailable. Call is running locally in this browser and will be stored securely in local memory.');
     }
 
@@ -529,10 +650,73 @@ function App() {
     const call = activeCallRef.current;
     if (!call) return;
     setBusy(true);
-    setError('');
+    setCloseError('');
 
-    // Ensure the current active stage is saved
-    const finalResults = await performSaveStage(words, notes, selectedTap);
+    // 1. Ensure current stage is saved locally
+    await performSaveStage(words, notes, selectedTap);
+
+    // 2. Ensure all pending stage records are synced to the cloud
+    const allSynced = await retrySyncAllPending();
+    const currentCall = activeCallRef.current;
+
+    // 3. Block silent closing if cloud writes failed or call is still offline
+    if (!allSynced || currentCall.isLocal) {
+      setBusy(false);
+      setCloseError('Cloud write failed: One or more stage records could not be synchronized to Supabase. To protect data integrity, this call has not been marked closed on the server.');
+      setCloseOfflineConfirm(true);
+      return;
+    }
+
+    // 4. Close the server record
+    const endedAt = new Date().toISOString();
+    try {
+      await request(`/calls/${currentCall.id}/close`, {
+        method: 'POST',
+        body: JSON.stringify({
+          outcome,
+          outcome_notes: outcomeNotes,
+          ended_at: endedAt,
+        }),
+      });
+    } catch (e) {
+      setBusy(false);
+      setCloseError(`Cloud close failed (${e.message}). The call stages are preserved in Supabase, but the closing status could not be finalized on the server.`);
+      setCloseOfflineConfirm(true);
+      return;
+    }
+
+    // 5. Cloud close succeeded! Persist to local history
+    const finalRecord = {
+      ...currentCall,
+      ended_at: endedAt,
+      outcome,
+      outcome_notes: outcomeNotes,
+      stage_results: Object.values(stageResultsRef.current),
+      current_stage_id: stage.id,
+      isLocal: false,
+      sync_status: 'synced',
+    };
+
+    try {
+      const local = JSON.parse(localStorage.getItem('sidecall-history') || '[]');
+      const filtered = local.filter(c => c.id !== currentCall.id);
+      localStorage.setItem('sidecall-history', JSON.stringify([finalRecord, ...filtered]));
+    } catch (e) {
+      console.warn('LocalStorage write failed:', e);
+    }
+
+    setFinishOpen(false);
+    setCloseOfflineConfirm(false);
+    setCloseError('');
+    setActiveCall(null);
+    setScreen('history');
+    await loadHistory();
+    setBusy(false);
+  }
+
+  function closeCallLocally() {
+    const call = activeCallRef.current;
+    if (!call) return;
 
     const endedAt = new Date().toISOString();
     const finalRecord = {
@@ -540,22 +724,15 @@ function App() {
       ended_at: endedAt,
       outcome,
       outcome_notes: outcomeNotes,
-      stage_results: Object.values(finalResults),
+      stage_results: Object.values(stageResultsRef.current).map(s => ({
+        ...s,
+        synced: s.synced || false,
+      })),
       current_stage_id: stage.id,
+      isLocal: true,
+      sync_status: 'unsynced',
     };
 
-    if (!call.isLocal) {
-      try {
-        await request(`/calls/${call.id}/close`, {
-          method: 'POST',
-          body: JSON.stringify({ outcome, outcome_notes: outcomeNotes }),
-        });
-      } catch (e) {
-        console.warn('Could not sync close to server:', e.message);
-      }
-    }
-
-    // Persist final closed record in localStorage
     try {
       const local = JSON.parse(localStorage.getItem('sidecall-history') || '[]');
       const filtered = local.filter(c => c.id !== call.id);
@@ -565,10 +742,96 @@ function App() {
     }
 
     setFinishOpen(false);
+    setCloseOfflineConfirm(false);
+    setCloseError('');
     setActiveCall(null);
     setScreen('history');
+    loadHistory();
+  }
+
+  // Uploads an entire offline-recorded call to Supabase cloud
+  async function syncOfflineCallRecord(offlineRecord) {
+    setSyncingCallId(offlineRecord.id);
+    setError('');
+    try {
+      const payload = {
+        prospect_name: offlineRecord.prospect_name || null,
+        company_name: offlineRecord.company_name || null,
+        started_at: offlineRecord.started_at,
+        ended_at: offlineRecord.ended_at,
+        outcome: offlineRecord.outcome || null,
+        outcome_notes: offlineRecord.outcome_notes || '',
+        current_stage_id: offlineRecord.current_stage_id || 'opening',
+        stage_results: (offlineRecord.stage_results || []).map(sr => ({
+          stage_id: sr.stage_id,
+          result: sr.result || 'completed',
+          prospect_words: sr.prospect_words || '',
+          notes: sr.notes || '',
+        })),
+      };
+
+      const synced = await request('/calls/sync-offline', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+
+      // Update local storage record
+      const local = JSON.parse(localStorage.getItem('sidecall-history') || '[]');
+      const updatedLocal = local.map(item => {
+        if (item.id === offlineRecord.id) {
+          return { ...synced, isLocal: false, sync_status: 'synced' };
+        }
+        return item;
+      });
+      localStorage.setItem('sidecall-history', JSON.stringify(updatedLocal));
+
+      if (detailCall && detailCall.id === offlineRecord.id) {
+        setDetailCall({ ...synced, isLocal: false, sync_status: 'synced' });
+      }
+
+      await loadHistory();
+    } catch (e) {
+      alert(`Sync failed: ${e.message}`);
+    } finally {
+      setSyncingCallId(null);
+    }
+  }
+
+  // Batch syncs all offline calls currently stored locally
+  async function syncAllOfflineCalls() {
+    const offlineCalls = history.filter(c => c.isLocal || c.sync_status === 'unsynced');
+    if (offlineCalls.length === 0) return;
+    setSyncingAllOffline(true);
+    for (const c of offlineCalls) {
+      try {
+        const payload = {
+          prospect_name: c.prospect_name || null,
+          company_name: c.company_name || null,
+          started_at: c.started_at,
+          ended_at: c.ended_at,
+          outcome: c.outcome || null,
+          outcome_notes: c.outcome_notes || '',
+          current_stage_id: c.current_stage_id || 'opening',
+          stage_results: (c.stage_results || []).map(sr => ({
+            stage_id: sr.stage_id,
+            result: sr.result || 'completed',
+            prospect_words: sr.prospect_words || '',
+            notes: sr.notes || '',
+          })),
+        };
+        const synced = await request('/calls/sync-offline', {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        });
+        const local = JSON.parse(localStorage.getItem('sidecall-history') || '[]');
+        const updatedLocal = local.map(item => item.id === c.id ? { ...synced, isLocal: false, sync_status: 'synced' } : item);
+        localStorage.setItem('sidecall-history', JSON.stringify(updatedLocal));
+      } catch (err) {
+        console.warn('Failed to sync offline record:', c.id, err);
+      }
+    }
+    setSyncingAllOffline(false);
     await loadHistory();
-    setBusy(false);
   }
 
   async function openCallDetail(c) {
@@ -919,12 +1182,12 @@ function App() {
                         <button
                           type="button"
                           className="lc-retry-sync-btn"
-                          onClick={() => performSaveStage(words, notes, selectedTap)}
+                          onClick={retrySyncAllPending}
                           disabled={savingStage}
-                          title="Retry syncing this stage draft to cloud"
+                          title="Retry syncing all pending stage records to cloud"
                         >
                           <RefreshCw size={11} className={savingStage ? 'spin-icon' : ''} />
-                          {savingStage ? 'Syncing…' : 'Retry Cloud Sync'}
+                          {savingStage ? 'Syncing…' : 'Retry All Pending'}
                         </button>
                       </div>
                     )}
@@ -1069,6 +1332,18 @@ function App() {
                     <strong>
                       {OUTCOMES.find(o => o.id === detailCall.outcome)?.label || detailCall.outcome || 'In progress'}
                     </strong>
+                    {(detailCall.isLocal || detailCall.sync_status === 'unsynced') && (
+                      <button
+                        type="button"
+                        className="sync-row-btn"
+                        style={{ marginLeft: 10 }}
+                        disabled={syncingCallId === detailCall.id}
+                        onClick={() => syncOfflineCallRecord(detailCall)}
+                      >
+                        <RefreshCw size={11} className={syncingCallId === detailCall.id ? 'spin-icon' : ''} />
+                        {syncingCallId === detailCall.id ? 'Syncing…' : 'Sync to Cloud'}
+                      </button>
+                    )}
                   </div>
                 </div>
 
@@ -1248,6 +1523,29 @@ function App() {
               </div>
             </div>
 
+            {history.some(c => c.isLocal || c.sync_status === 'unsynced') && (
+              <div className="history-offline-banner">
+                <div className="history-offline-info">
+                  <CloudOff size={16} />
+                  <span>
+                    <strong>
+                      {history.filter(c => c.isLocal || c.sync_status === 'unsynced').length} offline call record(s) stored locally.
+                    </strong>{' '}
+                    Cloud persistence pending.
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="sync-all-btn"
+                  onClick={syncAllOfflineCalls}
+                  disabled={syncingAllOffline}
+                >
+                  <RefreshCw size={12} className={syncingAllOffline ? 'spin-icon' : ''} />
+                  {syncingAllOffline ? 'Syncing…' : 'Sync All to Cloud'}
+                </button>
+              </div>
+            )}
+
             <div className="history-table">
               <div className="table-head">
                 <span>PROSPECT / COMPANY</span>
@@ -1318,8 +1616,23 @@ function App() {
                       </span>
 
                       <span>
-                        {c.isLocal ? (
-                          <span className="offline-badge">Offline (Local)</span>
+                        {c.isLocal || c.sync_status === 'unsynced' ? (
+                          <div className="storage-action-wrap" onClick={e => e.stopPropagation()}>
+                            <span className="unsynced-badge">Offline Draft</span>
+                            <button
+                              type="button"
+                              className="sync-row-btn"
+                              title="Upload this offline call to Supabase cloud"
+                              disabled={syncingCallId === c.id}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                syncOfflineCallRecord(c);
+                              }}
+                            >
+                              <RefreshCw size={10} className={syncingCallId === c.id ? 'spin-icon' : ''} />
+                              {syncingCallId === c.id ? '…' : 'Sync'}
+                            </button>
+                          </div>
                         ) : (
                           <span className="synced-badge">Synced</span>
                         )}
@@ -1399,23 +1712,60 @@ function App() {
               placeholder="e.g. Agreed to receive deck on WhatsApp; follow-up call Tuesday 11:30 AM."
             />
 
+            {closeError && (
+              <div className="finish-error-banner" role="alert">
+                <div className="finish-error-icon">
+                  <AlertTriangle size={16} />
+                </div>
+                <div className="finish-error-text">
+                  <strong>Persistence Warning:</strong> {closeError}
+                </div>
+              </div>
+            )}
+
             <div className="modal-footer">
               <button
                 className="quiet-button"
                 type="button"
-                onClick={() => setFinishOpen(false)}
+                onClick={() => {
+                  setFinishOpen(false);
+                  setCloseError('');
+                  setCloseOfflineConfirm(false);
+                }}
               >
                 Return to call
               </button>
-              <button
-                className="primary-button"
-                type="button"
-                onClick={closeCall}
-                disabled={busy}
-              >
-                <span>{busy ? 'Saving…' : 'Save and close call'}</span>
-                <Check size={16} />
-              </button>
+
+              {closeOfflineConfirm ? (
+                <div className="finish-dual-actions">
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={closeCallLocally}
+                  >
+                    Save as Offline Draft
+                  </button>
+                  <button
+                    className="primary-button"
+                    type="button"
+                    onClick={closeCall}
+                    disabled={busy || savingStage}
+                  >
+                    <RefreshCw size={14} className={busy ? 'spin-icon' : ''} />
+                    {busy ? 'Retrying…' : 'Retry Cloud Close'}
+                  </button>
+                </div>
+              ) : (
+                <button
+                  className="primary-button"
+                  type="button"
+                  onClick={closeCall}
+                  disabled={busy}
+                >
+                  <span>{busy ? 'Saving…' : 'Save and close call'}</span>
+                  <Check size={16} />
+                </button>
+              )}
             </div>
           </section>
         </div>

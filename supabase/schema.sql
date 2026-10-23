@@ -48,13 +48,21 @@ alter table public.calls add column if not exists ai_summary jsonb;
 -- caller_id = 'anonymous-caller'.
 -- Under caller-isolation rules, 'anonymous-caller' records are hidden from standard
 -- sales reps and are only visible to administrators (role='admin').
--- To safely reassign legacy calls to a specific sales rep without data loss, run:
 --
---   UPDATE public.calls
---   SET caller_id = 'target_rep_caller_id'
---   WHERE caller_id = 'anonymous-caller';
+-- IMPORTANT: Do NOT run a blanket update blindly assigning all records to a single rep.
+-- 1. First audit existing unassigned records to determine true ownership:
+--      SELECT id, prospect_name, company_name, started_at, outcome
+--      FROM public.calls
+--      WHERE caller_id = 'anonymous-caller'
+--      ORDER BY started_at DESC;
 --
--- NEVER run DELETE statements on legacy calls.
+-- 2. Selectively reassign records to specific sales reps based on account ownership:
+--      UPDATE public.calls
+--      SET caller_id = 'rep-alpha'
+--      WHERE caller_id = 'anonymous-caller'
+--        AND company_name IN ('Target Enterprise A', 'Target Enterprise B');
+--
+-- NEVER execute destructive DELETE statements on legacy calls.
 
 -- -----------------------------------------------------------------------------
 -- 3. Stage Results Table (Idempotent Upsert on call_id, stage_id)

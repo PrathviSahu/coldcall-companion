@@ -958,3 +958,79 @@ def test_admin_can_filter_calls_by_caller_id(mock_db):
     res_b = admin.get("/calls?caller_id=rep-beta").json()
     assert any(c["id"] == c_b["id"] for c in res_b)
     assert not any(c["id"] == c_a["id"] for c in res_b)
+
+
+def test_sync_offline_call_end_to_end(mock_db):
+    """
+    REGRESSION TEST: Verify that an entire offline-recorded call, including its
+    historical timestamps, stage results, and outcome, can be synchronized to the backend
+    atomically via POST /calls/sync-offline under the caller's identity.
+    """
+    payload = {
+        "prospect_name": "Offline Prospect Corp",
+        "company_name": "Apex Engineering Mumbai",
+        "started_at": "2026-10-23T14:00:00+00:00",
+        "ended_at": "2026-10-23T14:04:30+00:00",
+        "outcome": "agreed_to_receive_report",
+        "outcome_notes": "Agreed to review case study on WhatsApp; follow up next week",
+        "current_stage_id": "their_need",
+        "stage_results": [
+            {
+                "stage_id": "opening",
+                "result": "Reached right person",
+                "prospect_words": "Yes this is Rajesh speaking",
+                "notes": "Verified title directly",
+            },
+            {
+                "stage_id": "purpose",
+                "result": "Gave 30 seconds",
+                "prospect_words": "Make it quick please",
+                "notes": "Tone was hurried but receptive",
+            },
+            {
+                "stage_id": "their_need",
+                "result": "Stated specific priority/bottleneck",
+                "prospect_words": "Our current logistics vendor is delayed in Nhava Sheva",
+                "notes": "Identified port clearance latency as core pain point",
+            },
+        ],
+    }
+
+    res = client.post("/calls/sync-offline", json=payload)
+    assert res.status_code == 200, res.text
+    call_data = res.json()
+    assert call_data["id"] is not None
+    assert call_data["caller_id"] == "rep-alpha"
+    assert call_data["prospect_name"] == "Offline Prospect Corp"
+    assert call_data["company_name"] == "Apex Engineering Mumbai"
+    assert call_data["outcome"] == "agreed_to_receive_report"
+    assert len(call_data["stage_results"]) == 3
+
+    # Verify retrieval from GET /calls/{id}
+    detail = client.get(f"/calls/{call_data['id']}").json()
+    assert detail["id"] == call_data["id"]
+    assert detail["ended_at"] is not None
+    assert len(detail["stage_results"]) == 3
+
+
+def test_sync_offline_call_invalid_outcome_rejected(mock_db):
+    """
+    REGRESSION TEST: Verify that offline sync still strictly validates final outcomes
+    and rejects fraudulent or unrecognized outcome strings with 422.
+    """
+    payload = {
+        "prospect_name": "Invalid Outcome Prospect",
+        "outcome": "fraudulent_outcome_unregistered",
+    }
+    res = client.post("/calls/sync-offline", json=payload)
+    assert res.status_code == 422
+
+
+def test_sync_offline_call_requires_auth():
+    """
+    REGRESSION TEST: Verify that offline synchronization requires valid authentication.
+    """
+    unauthed = TestClient(app)
+    payload = {"prospect_name": "Unauthed Prospect"}
+    res = unauthed.post("/calls/sync-offline", json=payload)
+    assert res.status_code == 401

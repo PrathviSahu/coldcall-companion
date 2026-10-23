@@ -54,10 +54,17 @@ Derived directly from the DeepThought cold-call structure guidelines and empiric
 6. **Quotation Integrity (Read-Only Sample Patterns)**:
    - Behavioral cues (`prospect_patterns`) derived from transcript analysis are presented as read-only situational cues (`OBSERVED CUES (READ-ONLY)`).
    - The UI does not provide auto-append buttons into verbatim fields. Actual prospect quotes must be explicitly typed by the caller to ensure synthetic phrases never pollute compliance records.
-7. **Failed Stage Save Recovery & Reconciliation**:
-   - If backend stage persistence encounters network interruption or a 5xx error, the local draft is preserved in state.
-   - The UI displays an amber `PENDING SYNC` status badge and an alert banner with a `Retry Cloud Sync` action.
-   - Retries perform an idempotent upsert (`on_conflict="call_id,stage_id"`), reconciling server state with the caller's latest edits without creating duplicate records or overwriting newer drafts.
+7. **Per-Stage Sync Tracking & Exhaustive Retry**:
+   - **Per-Stage Status**: Every stage record maintains independent synchronization tracking (`synced: boolean`, `sync_error`). A successful save on a later stage NEVER clears an earlier failed save; the UI checks all recorded stages and displays exactly which stages remain pending.
+   - **Retry All Pending**: The retry mechanism triggers `retrySyncAllPending()`, which provisions the call in Supabase if started offline and uploads every outstanding stage result.
+8. **Guaranteed Cloud Save on Call Wrap-Up**:
+   - `closeCall()` strictly verifies that all stage records are synchronized to Supabase before marking a call closed.
+   - If network writes fail during close, the modal blocks silent dismissal and warns the caller with explicit dual actions:
+     - **Retry Cloud Close**: Retries syncing all pending records and finalizing the cloud record.
+     - **Save as Offline Draft**: Preserves the complete draft locally with an `UNSYNCED DRAFT` tag so callers can wrap up without data loss.
+9. **Offline Draft Recovery & Cloud Replay (`POST /calls/sync-offline`)**:
+   - Calls recorded while offline or saved locally can be synchronized to Supabase anytime from the Call History table or Call Detail view.
+   - The backend `POST /calls/sync-offline` endpoint atomically establishes the call, inserts all historical stage notes, and sets the outcome with authentic start and end timestamps.
 
 ---
 
@@ -73,14 +80,25 @@ Derived directly from the DeepThought cold-call structure guidelines and empiric
    - Indexes and Row Level Security policies.
    The script is fully idempotent (`ON CONFLICT (id) DO UPDATE`).
 
-4. **Legacy Record Reassignment (Optional)**:
+4. **Selective Legacy Record Audit & Reassignment**:
    Pre-existing call records created prior to caller authentication have `caller_id = 'anonymous-caller'`. Under strict isolation, regular sales reps will not see these records; only administrators (configured with `:admin` role) have visibility.
-   To safely reassign legacy calls to an active rep without deleting any call history, execute the following SQL in Supabase:
-   ```sql
-   UPDATE public.calls
-   SET caller_id = 'YOUR_REP_ID'
-   WHERE caller_id = 'anonymous-caller';
-   ```
+   
+   **IMPORTANT**: Do NOT execute a blanket update assigning all records to a single rep without reviewing deal ownership.
+   1. Audit unassigned calls:
+      ```sql
+      SELECT id, prospect_name, company_name, started_at, outcome
+      FROM public.calls
+      WHERE caller_id = 'anonymous-caller'
+      ORDER BY started_at DESC;
+      ```
+   2. Selectively reassign based on true account ownership:
+      ```sql
+      UPDATE public.calls
+      SET caller_id = 'rep-alpha'
+      WHERE caller_id = 'anonymous-caller'
+        AND company_name IN ('Target Enterprise A', 'Target Enterprise B');
+      ```
+   *NEVER execute destructive DELETE statements on legacy calls.*
 
 ### 2. Backend (FastAPI)
 ```bash

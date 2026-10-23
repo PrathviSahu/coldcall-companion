@@ -280,6 +280,7 @@ ALLOWED_OUTCOMES = {
 class StartCall(BaseModel):
     prospect_name: str | None = Field(default=None, max_length=160)
     company_name: str | None = Field(default=None, max_length=180)
+    started_at: datetime | None = None
 
 class SaveStage(BaseModel):
     stage_id: str
@@ -290,6 +291,17 @@ class SaveStage(BaseModel):
 class CloseCall(BaseModel):
     outcome: str = Field(..., max_length=100)
     outcome_notes: str = Field(default="", max_length=4000)
+    ended_at: datetime | None = None
+
+class SyncOfflineCall(BaseModel):
+    prospect_name: str | None = Field(default=None, max_length=160)
+    company_name: str | None = Field(default=None, max_length=180)
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    outcome: str | None = Field(default=None, max_length=100)
+    outcome_notes: str = Field(default="", max_length=4000)
+    current_stage_id: str | None = None
+    stage_results: list[SaveStage] = Field(default_factory=list)
 
 class UpdateStage(BaseModel):
     stage_id: str
@@ -364,12 +376,14 @@ def start_call(payload: StartCall, caller: Caller = Depends(get_current_caller))
     d = db()
     stages = list_stages()
     first_stage_id = stages[0]["id"] if stages else "opening"
-    row = {
+    row: dict[str, Any] = {
         "caller_id": caller.id,
         "prospect_name": payload.prospect_name,
         "company_name": payload.company_name,
         "current_stage_id": first_stage_id,
     }
+    if payload.started_at:
+        row["started_at"] = payload.started_at.isoformat()
     response = d.table("calls").insert(row).execute()
     if not response.data:
         raise HTTPException(500, "Could not create call")
@@ -459,14 +473,77 @@ def close_call(
     if call.get("ended_at"):
         raise HTTPException(409, "Call is already closed")
 
+    ended_at_val = payload.ended_at.isoformat() if payload.ended_at else datetime.now(timezone.utc).isoformat()
     response = d.table("calls").update({
         "outcome": payload.outcome,
         "outcome_notes": payload.outcome_notes,
-        "ended_at": datetime.now(timezone.utc).isoformat(),
+        "ended_at": ended_at_val,
     }).eq("id", str(call_id)).execute()
     if not response.data:
         raise HTTPException(500, "Could not close call")
     return response.data[0]
+
+
+@app.post("/calls/sync-offline")
+def sync_offline_call(
+    payload: SyncOfflineCall,
+    caller: Caller = Depends(get_current_caller)
+) -> dict[str, Any]:
+    """
+    Synchronizes an offline-created call, its stage results, and optional close outcome
+    atomically into Supabase under the authenticated caller's identity.
+    """
+    d = db()
+    stages = list_stages()
+    valid_stages = {s["id"] for s in stages}
+    first_stage_id = stages[0]["id"] if stages else "opening"
+
+    if payload.outcome and payload.outcome not in ALLOWED_OUTCOMES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid outcome: '{payload.outcome}'. Must be one of: {sorted(ALLOWED_OUTCOMES)}"
+        )
+
+    started_at_str = payload.started_at.isoformat() if payload.started_at else datetime.now(timezone.utc).isoformat()
+    current_stage = payload.current_stage_id if payload.current_stage_id in valid_stages else first_stage_id
+
+    call_row: dict[str, Any] = {
+        "caller_id": caller.id,
+        "prospect_name": payload.prospect_name,
+        "company_name": payload.company_name,
+        "current_stage_id": current_stage,
+        "started_at": started_at_str,
+    }
+    if payload.outcome:
+        call_row["outcome"] = payload.outcome
+        call_row["outcome_notes"] = payload.outcome_notes
+        call_row["ended_at"] = payload.ended_at.isoformat() if payload.ended_at else datetime.now(timezone.utc).isoformat()
+
+    call_res = d.table("calls").insert(call_row).execute()
+    if not call_res.data:
+        raise HTTPException(500, "Could not create call from offline record")
+    created_call = call_res.data[0]
+    call_id = created_call["id"]
+
+    saved_stages = []
+    for sr in payload.stage_results:
+        if sr.stage_id not in valid_stages:
+            continue
+        stage_row = {
+            "call_id": str(call_id),
+            "stage_id": sr.stage_id,
+            "result": sr.result,
+            "prospect_words": sr.prospect_words,
+            "notes": sr.notes,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        res = d.table("call_stage_results").upsert(stage_row, on_conflict="call_id,stage_id").execute()
+        if res.data:
+            saved_stages.append(res.data[0])
+
+    created_call["stage_results"] = saved_stages
+    return created_call
+
 
 
 @app.get("/calls")

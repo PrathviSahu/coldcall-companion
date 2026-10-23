@@ -2667,3 +2667,113 @@ button:disabled {
   background: #fdf5df;
   border-color: #8c6812;
 }
+
+
+/* ── Finish Modal Error Banner, Dual Actions & History Offline Sync ── */
+.finish-error-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  background: #fdf3f2;
+  border: 1px solid #f6c8c4;
+  border-radius: 6px;
+  padding: 12px 14px;
+  margin-top: 16px;
+  color: #93231a;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.finish-error-icon {
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.finish-dual-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.history-offline-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  background: #fffbf0;
+  border: 1px solid #fce8b3;
+  border-radius: 6px;
+  padding: 12px 16px;
+  margin-bottom: 20px;
+}
+
+.history-offline-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: #8c6812;
+}
+
+.sync-all-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #ffffff;
+  border: 1px solid #d9bd77;
+  border-radius: 4px;
+  padding: 6px 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: #8c6812;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.sync-all-btn:hover:not(:disabled) {
+  background: #fdf5df;
+  border-color: #8c6812;
+}
+
+.storage-action-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.unsynced-badge {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 3px;
+  background: #fef9ee;
+  color: #926914;
+  border: 1px solid #f7e3af;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.sync-row-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 7px;
+  border-radius: 3px;
+  background: #ffffff;
+  border: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text);
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+
+.sync-row-btn:hover:not(:disabled) {
+  background: #f4f3ec;
+  border-color: var(--green);
+  color: var(--green);
+}
