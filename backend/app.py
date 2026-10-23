@@ -502,30 +502,70 @@ def close_call(
             detail=f"Invalid outcome: '{payload.outcome}'. Must be one of: {sorted(ALLOWED_OUTCOMES)}"
         )
 
+    ended_at_val = payload.ended_at.isoformat() if payload.ended_at else datetime.now(timezone.utc).isoformat()
+
+    # 1. Attempt Atomic PostgreSQL Transactional RPC (Primary row-locked path)
+    # The RPC acquires a row lock (FOR UPDATE), enforces authorization, and guarantees
+    # that concurrent requests with different outcomes cannot overwrite one another.
+    try:
+        rpc_res = d.rpc("close_call_transaction", {
+            "p_call_id": str(call_id),
+            "p_caller_id": caller.id,
+            "p_caller_role": caller.role,
+            "p_outcome": payload.outcome,
+            "p_outcome_notes": payload.outcome_notes,
+            "p_ended_at": ended_at_val,
+        }).execute()
+        if rpc_res and rpc_res.data:
+            return rpc_res.data
+    except Exception as exc:
+        err_msg = str(exc)
+        if "NotFound" in err_msg or "P0002" in err_msg:
+            raise HTTPException(404, "Call not found")
+        if "Forbidden" in err_msg or "42501" in err_msg:
+            raise HTTPException(403, "Forbidden: You are not authorized to close this call")
+        if "already finalized" in err_msg or "Conflict" in err_msg or "23505" in err_msg:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Call is already closed with conflicting outcome: {err_msg}"
+            )
+        # If the RPC function does not exist in mock or database, use the atomic conditional table update below
+        if "function close_call_transaction" not in err_msg.lower() and "not implemented" not in err_msg.lower():
+            raise HTTPException(500, f"Could not close call: {exc}")
+
+    # 2. Atomic Conditional Table Update (Defense-in-depth / Mock fallback)
     call = d.table("calls").select("id,caller_id,ended_at,outcome,outcome_notes").eq("id", str(call_id)).maybe_single().execute().data
     if not call:
         raise HTTPException(404, "Call not found")
     if call.get("caller_id") != caller.id and caller.role != "admin":
         raise HTTPException(403, "Forbidden: You are not authorized to close this call")
-    if call.get("ended_at"):
-        # Safe idempotent retry: if outcome matches, return the finalized call (handles ambiguous network retry)
+    if call.get("ended_at") is not None or call.get("outcome") is not None:
         if call.get("outcome") == payload.outcome:
             full = d.table("calls").select("*").eq("id", str(call_id)).maybe_single().execute().data
             return full or call
-        else:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Call is already closed with conflicting outcome '{call.get('outcome')}'"
-            )
+        raise HTTPException(
+            status_code=409,
+            detail=f"Call is already closed with conflicting outcome '{call.get('outcome')}'"
+        )
 
-    ended_at_val = payload.ended_at.isoformat() if payload.ended_at else datetime.now(timezone.utc).isoformat()
+    # Atomic conditional update: only update if ended_at is still null
     response = d.table("calls").update({
         "outcome": payload.outcome,
         "outcome_notes": payload.outcome_notes,
         "ended_at": ended_at_val,
-    }).eq("id", str(call_id)).execute()
+    }).eq("id", str(call_id)).is_("ended_at", "null").execute()
+
     if not response.data:
-        raise HTTPException(500, "Could not close call")
+        # Concurrent request finalized the call between read and update; re-check outcome
+        recheck = d.table("calls").select("*").eq("id", str(call_id)).maybe_single().execute().data
+        if recheck and recheck.get("outcome") == payload.outcome:
+            return recheck
+        conflict_outcome = recheck.get("outcome") if recheck else "unknown"
+        raise HTTPException(
+            status_code=409,
+            detail=f"Call is already closed with conflicting outcome '{conflict_outcome}'"
+        )
+
     return response.data[0]
 
 

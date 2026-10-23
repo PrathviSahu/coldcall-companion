@@ -218,6 +218,40 @@ class MockSupabaseClient:
                 if getattr(self.client, "_simulate_missing_rpc", False):
                     raise Exception("function sync_offline_call_transaction does not exist")
 
+                if self.fn == "close_call_transaction":
+                    with getattr(self.client, "_lock", threading.Lock()):
+                        call_id = self.params.get("p_call_id")
+                        caller_id = self.params.get("p_caller_id")
+                        caller_role = self.params.get("p_caller_role")
+                        outcome = self.params.get("p_outcome")
+                        notes = self.params.get("p_outcome_notes")
+                        ended_at = self.params.get("p_ended_at") or datetime.now(timezone.utc).isoformat()
+
+                        calls = self.client.db_state["calls"]
+                        target = None
+                        for c in calls:
+                            if str(c.get("id")) == str(call_id):
+                                target = c
+                                break
+                        if not target:
+                            raise Exception(f"NotFound: Call {call_id} not found")
+
+                        if target.get("caller_id") != caller_id and caller_role != "admin":
+                            raise Exception("Forbidden: You are not authorized to close this call")
+
+                        if target.get("ended_at") or target.get("outcome"):
+                            if target.get("outcome") != outcome:
+                                raise Exception(f"Conflict: Call {call_id} is already finalized with outcome {target.get('outcome')}")
+                            # Matching outcome: idempotent retry
+                        else:
+                            target["outcome"] = outcome
+                            target["outcome_notes"] = notes or target.get("outcome_notes") or ""
+                            target["ended_at"] = ended_at
+
+                        res_obj = dict(target)
+                        res_obj["stage_results"] = [s for s in self.client.db_state["call_stage_results"] if str(s.get("call_id")) == str(call_id)]
+                        return Result(res_obj)
+
                 if self.fn == "sync_offline_call_transaction":
                     with getattr(self.client, "_lock", threading.Lock()):
                         if getattr(self.client, "_simulate_rpc_failure", False):
@@ -1947,3 +1981,133 @@ def test_real_postgresql_competing_call_creation_and_conflicting_finalization():
     assert data["id"] == existing_id
     assert data["outcome"] == "meeting_booked"
     assert len(data["stage_results"]) == 1
+
+
+def test_concurrent_close_requests_cannot_overwrite_conflicting_outcomes(mock_db):
+    """
+    CONCURRENCY TEST: Verify that when two concurrent close requests with different
+    outcomes target the same open call, exactly one succeeds and the other receives
+    HTTP 409 Conflict. The persisted outcome must never be overwritten.
+    """
+    # 1. Start an open call
+    res_start = client.post("/calls", json={"prospect_name": "Race Close Prospect", "company_name": "Race Corp"})
+    assert res_start.status_code == 200
+    call_id = res_start.json()["id"]
+
+    # 2. Concurrently execute two close requests with conflicting outcomes
+    def do_close(outcome):
+        return client.post(f"/calls/{call_id}/close", json={"outcome": outcome, "outcome_notes": f"Notes for {outcome}"})
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        f1 = executor.submit(do_close, "meeting_booked")
+        f2 = executor.submit(do_close, "not_interested")
+        r1, r2 = f1.result(), f2.result()
+
+    statuses = {r1.status_code, r2.status_code}
+    assert statuses == {200, 409}, f"Expected {200, 409}, got: {[r1.status_code, r2.status_code]}"
+
+    # Determine winner
+    winner = r1 if r1.status_code == 200 else r2
+    winning_outcome = winner.json()["outcome"]
+
+    # 3. Verify database outcome matches winner and was not overwritten
+    db_call = [c for c in mock_db.db_state["calls"] if str(c.get("id")) == str(call_id)][0]
+    assert db_call["outcome"] == winning_outcome
+
+    # 4. Idempotent retry with winning outcome returns 200 OK
+    retry_win = client.post(f"/calls/{call_id}/close", json={"outcome": winning_outcome})
+    assert retry_win.status_code == 200
+    assert retry_win.json()["outcome"] == winning_outcome
+
+    # 5. Retry with conflicting outcome fails with 409 Conflict
+    other_outcome = "not_interested" if winning_outcome == "meeting_booked" else "meeting_booked"
+    retry_lose = client.post(f"/calls/{call_id}/close", json={"outcome": other_outcome})
+    assert retry_lose.status_code == 409
+    assert "conflicting outcome" in retry_lose.text
+
+
+def test_real_postgresql_concurrent_close_call_conflict_rejection():
+    """
+    REAL POSTGRESQL TEST: Spawns 2 concurrent psql processes executing
+    close_call_transaction on the same open call in PostgreSQL with different outcomes.
+    Proves that PostgreSQL row-locking (FOR UPDATE) serializes execution, exactly 1 succeeds,
+    the competing call receives 23505 conflict exception, the winner outcome is preserved,
+    and matching outcome retry succeeds.
+    """
+    if not _check_real_postgres():
+        pytest.skip("Local PostgreSQL database coldcall_test not available")
+
+    # Re-apply migrations
+    subprocess.run([PSQL_BIN, "-d", "coldcall_test", "-f", "supabase/migrations/20261023_secure_close_call_rpc.sql"], capture_output=True, text=True)
+
+    # 1. Create open call with unique key
+    test_close_key = f"pg-close-race-{uuid4()}"
+    ins_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        INSERT INTO public.calls (
+          caller_id, client_call_id, prospect_name, company_name, current_stage_id, started_at
+        ) VALUES (
+          'rep-alpha', '{test_close_key}', 'Close Race Prospect', 'Close Race Ltd', 'opening', NOW()
+        ) RETURNING id;
+        """
+    ]
+    ins_res = subprocess.run(ins_cmd, capture_output=True, text=True)
+    assert ins_res.returncode == 0, f"Insert failed: {ins_res.stderr}"
+    call_id = ins_res.stdout.strip().splitlines()[0]
+
+    # 2. Concurrently execute close_call_transaction with conflicting outcomes
+    def worker(outcome):
+        cmd = [
+            PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+            f"""
+            SELECT public.close_call_transaction(
+              '{call_id}'::uuid,
+              'rep-alpha',
+              'caller',
+              '{outcome}',
+              'Notes for {outcome}',
+              NOW()
+            );
+            """
+        ]
+        return outcome, subprocess.run(cmd, capture_output=True, text=True)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        f1 = executor.submit(worker, "meeting_booked")
+        f2 = executor.submit(worker, "not_interested")
+        res1, res2 = f1.result(), f2.result()
+
+    results = [res1, res2]
+    successes = [r for r in results if r[1].returncode == 0]
+    conflicts = [r for r in results if r[1].returncode != 0]
+
+    assert len(successes) == 1, f"Expected exactly 1 success, got {len(successes)}"
+    assert len(conflicts) == 1, f"Expected exactly 1 conflict, got {len(conflicts)}"
+    assert "already finalized with outcome" in conflicts[0][1].stderr
+
+    winner_outcome = successes[0][0]
+
+    # 3. Verify database preserved winner outcome
+    chk_cmd = [PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c", f"SELECT outcome FROM public.calls WHERE id = '{call_id}';"]
+    chk_res = subprocess.run(chk_cmd, capture_output=True, text=True)
+    assert chk_res.stdout.strip() == winner_outcome
+
+    # 4. Matching outcome retry succeeds
+    retry_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SELECT public.close_call_transaction(
+          '{call_id}'::uuid,
+          'rep-alpha',
+          'caller',
+          '{winner_outcome}',
+          'Retry notes',
+          NOW()
+        );
+        """
+    ]
+    r_res = subprocess.run(retry_cmd, capture_output=True, text=True)
+    assert r_res.returncode == 0
+    data = json.loads(r_res.stdout.strip())
+    assert data["outcome"] == winner_outcome

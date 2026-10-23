@@ -68,9 +68,10 @@ Derived directly from the DeepThought cold-call structure guidelines and empiric
    - **RPC Security & Isolation**: The function pins `SET search_path = ''` with fully schema-qualified relation references (`public.*`, `pg_catalog.*`), revokes execution privileges from `PUBLIC`, `anon`, and `authenticated`, and grants execute solely to `service_role`. The backend derives `p_caller_id` from the authenticated caller token.
    - **Migration Guidance (No Silent Non-Atomic Fallback)**: Misleading non-atomic multi-request REST fallbacks have been removed. If the RPC function is not yet installed in Supabase, the backend returns `503 Service Unavailable` with instructions to apply `supabase/migrations/20261023_secure_sync_offline_rpc.sql` or `supabase/schema.sql`.
    - **Strict Pre-Validation (No Silent Ingestion)**: Before writing any data to the database, the endpoint validates that every stage ID in `stage_results` is recognized. Unrecognized stage IDs, duplicate stage entries, invalid outcomes, or inverted timestamps immediately reject the request with `422 Unprocessable Entity`—zero orphan or partial records are written.
-10. **Ambiguous Network Close Recovery & Idempotency**:
-   - If a call is closed on the server but the HTTP response is dropped or timed out, retrying `POST /calls/{id}/close` with the matching outcome returns `200 OK` with the finalized call data rather than throwing an error.
-   - Retries with a conflicting outcome are rejected with `409 Conflict`, ensuring finalized calls cannot be overwritten.
+10. **Atomic Call Closure & Ambiguous Network Recovery**:
+   - **Row-Locked Atomic Finalization**: `POST /calls/{id}/close` executes `close_call_transaction` (`SELECT ... FOR UPDATE`), serializing concurrent close attempts in PostgreSQL. Two simultaneous close requests with differing outcomes can never overwrite each other; exactly one succeeds and the conflicting request is rejected with `409 Conflict`.
+   - **Safe Idempotent Retries**: If a call is closed on the server but the HTTP response is dropped or timed out, retrying `POST /calls/{id}/close` with the matching outcome returns `200 OK` with the finalized call data without mutating persisted outcome notes or timestamps.
+   - **Conflicting Outcome Guard**: Retries with a conflicting outcome are strictly rejected with `409 Conflict`, guaranteeing finalized outcomes are immutable.
    - The frontend automatically verifies server closure status after a network drop, preventing duplicate records or false error states.
 
 ---
