@@ -1,0 +1,406 @@
+from __future__ import annotations
+import os
+from datetime import datetime, timezone
+from typing import Any
+from uuid import UUID
+import json
+
+from fastapi import FastAPI, HTTPException
+import httpx
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+try:
+    from supabase import create_client, Client
+except ImportError:  # allows local health/stage previews before installing optional DB dependency
+    Client = Any  # type: ignore[misc,assignment]
+    create_client = None
+
+app = FastAPI(title="ColdCall Companion API", version="0.2.0")
+allowed_origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if x.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins if allowed_origins else ["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+supabase: Client | None = None
+if create_client is not None and os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_SERVICE_ROLE_KEY"):
+    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
+
+STARTER_STAGES: list[dict[str, Any]] = [
+    {
+        "id": "opening",
+        "position": 1,
+        "title": "Opening",
+        "purpose": "Reach the right person and say who you are. The prospect decides in the first ten seconds whether this call is worth a minute.",
+        "guidance": "Be brief, direct, and natural. Verify identity immediately; do not pitch to an assistant or switchboard.",
+        "prospect_patterns": [
+            "Can you please come again? From where are you calling?",
+            "I'll let you know the concerned person. You can call directly.",
+            "The person you are asking for left the company last year.",
+        ],
+        "stage_taps": [
+            "Reached right person",
+            "Wrong person / referral",
+            "Contact left company",
+            "Switchboard / PA barrier",
+        ],
+    },
+    {
+        "id": "purpose",
+        "position": 2,
+        "title": "Purpose",
+        "purpose": "Say in one or two sentences why you called, in words the prospect can repeat to a colleague. A purpose they cannot repeat is a purpose they did not hear.",
+        "guidance": "Give a concrete reason for calling without corporate jargon. Avoid sounding like a scripted telemarketer.",
+        "prospect_patterns": [
+            "What is this about? Can you just elaborate?",
+            "Uh, from where? What does your company do?",
+            "Who gave you this number? Where did you get my contact?",
+            "Is this a sales call? What are you proposing?",
+        ],
+        "stage_taps": [
+            "Understood & listening",
+            "Asked what company does",
+            "Asked where we got number",
+            "Flagged as sales call",
+        ],
+    },
+    {
+        "id": "permission",
+        "position": 3,
+        "title": "Permission",
+        "purpose": "Find out whether they are willing to talk now. A clear yes, a clear no, or a time to call back are all good outcomes. Talking on without one is not.",
+        "guidance": "Test whether they have time right now. Never talk over a busy prospect; secure a specific callback window.",
+        "prospect_patterns": [
+            "Actually right now I'm in a customer meeting. Can you call after 2 PM?",
+            "I am driving right now, but tell me quickly.",
+            "Can you call me tomorrow afternoon? I will have a few minutes.",
+            "Send it on WhatsApp first. Let me see it before we talk.",
+        ],
+        "stage_taps": [
+            "Agreed to talk now",
+            "Callback requested (named time)",
+            "Driving / in meeting",
+            "Send WhatsApp/Email first",
+        ],
+    },
+    {
+        "id": "their_business",
+        "position": 4,
+        "title": "Their business",
+        "purpose": "Ask about their company and their work before saying anything about yours. People talk about what they do; they rarely listen to what you do.",
+        "guidance": "Ask an informed, open question about their operations or focus. Let them speak first; do not jump to the pitch.",
+        "prospect_patterns": [
+            "Tell me about your company first, then we can get into details.",
+            "Our company is the market leader; we don't fit that profile.",
+            "That pertains to manufacturing; I only handle corporate strategy.",
+            "We operate primarily through an authorized distributor network.",
+        ],
+        "stage_taps": [
+            "Shared operations & setup",
+            "Corrected business model",
+            "Turned question to caller",
+            "Gave minimal 1-line answer",
+        ],
+    },
+    {
+        "id": "their_need",
+        "position": 5,
+        "title": "Their need, in their words",
+        "purpose": "Hear what they are trying to do or struggling with, in their own words. This is the one stage where the caller writes down exactly what was said.",
+        "guidance": "Log their exact words verbatim in the quote box. Do not summarize or paraphrase what they said.",
+        "prospect_patterns": [
+            "Our main priority right now is expanding export margins and plant utilization.",
+            "We don't believe in external experiments. We are fine with our current business.",
+            "Because we are still an early startup, we don't have the budget or requirement for that now.",
+            "What exactly would you require from our side to make this work?",
+        ],
+        "stage_taps": [
+            "Stated specific priority/bottleneck",
+            "Said everything is fine / no need",
+            "Startup / too early for advisory",
+            "Asked what we can do for them",
+        ],
+    },
+    {
+        "id": "objection",
+        "position": 6,
+        "title": "Objection",
+        "purpose": "Hear the reason for a no and understand it. A reason you understand can be answered on this call or the next; a reason you talked over cannot.",
+        "guidance": "Acknowledge the objection without becoming defensive. Clarify whether it is contract lock-in, internal capability, or bad timing.",
+        "prospect_patterns": [
+            "Because we are an MNC, we already have such consultants at a global level under a single contract.",
+            "We already engaged a consultant last month; that's going to run for two quarters.",
+            "We have a robust process internally which we use for problem solving; we don't outsource.",
+            "I am not interested in this at the moment. Thank you for asking though.",
+        ],
+        "stage_taps": [
+            "Global contract / locked vendor",
+            "Internal team / robust process",
+            "No budget / not a priority",
+            "Send info in writing first",
+        ],
+    },
+    {
+        "id": "next_step",
+        "position": 7,
+        "title": "Next step",
+        "purpose": "Agree one concrete thing: a document on WhatsApp or email, a call at a named time, a meeting. One thing, named, with a time or a channel.",
+        "guidance": "Lock down a specific channel or date/time. A time named by them is worth more than a time proposed by you.",
+        "prospect_patterns": [
+            "You send it on WhatsApp to this number. Let me have a look and come back to you.",
+            "That's my personal email; please send it to my official company ID.",
+            "Give me a call sometime Tuesday morning around 11:30 AM after my meeting.",
+            "You can send an email with your previous profiles and case studies for review.",
+        ],
+        "stage_taps": [
+            "Specific callback time set",
+            "Official email deck agreed",
+            "WhatsApp brief requested",
+            "Referred to colleague with contact",
+        ],
+    },
+    {
+        "id": "close",
+        "position": 8,
+        "title": "Close",
+        "purpose": "End the call clearly and record what happened: the outcome, the next step, and the prospect's words from stage 5. The record is what the next call is built on.",
+        "guidance": "End professionally and immediately record the honest outcome. Never log an outcome that contradicts what the prospect said.",
+        "prospect_patterns": [
+            "Sure, thank you Priya/Rohit. Send it over email and we will connect next week.",
+            "All set. Thank you for your time, have a good day.",
+            "Okay, fine, works. Bye.",
+            "[Call disconnected / line dropped]",
+        ],
+        "stage_taps": [
+            "Confirmed next step & closed clean",
+            "Polite exit after objection",
+            "Line dropped / hung up",
+            "Logged discrepancy for next call",
+        ],
+    },
+]
+
+class StartCall(BaseModel):
+    prospect_name: str | None = Field(default=None, max_length=160)
+    company_name: str | None = Field(default=None, max_length=180)
+
+class SaveStage(BaseModel):
+    stage_id: str
+    result: str = Field(default="completed", max_length=160)
+    prospect_words: str = Field(default="", max_length=10000)
+    notes: str = Field(default="", max_length=4000)
+
+class CloseCall(BaseModel):
+    outcome: str = Field(..., max_length=100)
+    outcome_notes: str = Field(default="", max_length=4000)
+
+class UpdateStage(BaseModel):
+    stage_id: str
+
+
+def db() -> Client:
+    if supabase is None:
+        raise HTTPException(status_code=503, detail="Database is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.")
+    return supabase
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    configured = supabase is not None
+    llm_configured = bool(os.getenv("LLM_API_KEY"))
+    if not configured:
+        return {
+            "status": "ok",
+            "database": "not_configured",
+            "llm": "configured" if llm_configured else "disabled",
+            "service": "coldcall-companion-api",
+            "version": "0.2.0"
+        }
+    try:
+        db().table("call_stages").select("id").limit(1).execute()
+        return {
+            "status": "ok",
+            "database": "connected",
+            "llm": "configured" if llm_configured else "disabled",
+            "service": "coldcall-companion-api",
+            "version": "0.2.0"
+        }
+    except Exception as exc:
+        return {
+            "status": "degraded",
+            "database": "error",
+            "llm": "configured" if llm_configured else "disabled",
+            "detail": str(exc)[:180],
+            "service": "coldcall-companion-api",
+            "version": "0.2.0"
+        }
+
+@app.get("/stages")
+def list_stages() -> list[dict[str, Any]]:
+    if supabase is None:
+        return STARTER_STAGES
+    try:
+        response = db().table("call_stages").select("*").order("position").execute()
+        if response.data and len(response.data) == 8:
+            return response.data
+        return STARTER_STAGES
+    except Exception:
+        return STARTER_STAGES
+
+@app.post("/calls")
+def start_call(payload: StartCall) -> dict[str, Any]:
+    stages = list_stages()
+    first_stage_id = stages[0]["id"] if stages else "opening"
+    row = {
+        "prospect_name": payload.prospect_name,
+        "company_name": payload.company_name,
+        "current_stage_id": first_stage_id
+    }
+    response = db().table("calls").insert(row).execute()
+    if not response.data:
+        raise HTTPException(500, "Could not create call")
+    return response.data[0]
+
+@app.post("/calls/{call_id}/stage-results")
+def save_stage(call_id: UUID, payload: SaveStage) -> dict[str, Any]:
+    d = db()
+    valid_stages = {s["id"] for s in list_stages()}
+    if payload.stage_id not in valid_stages:
+        raise HTTPException(400, f"Unknown stage_id: {payload.stage_id}")
+    call = d.table("calls").select("id,ended_at").eq("id", str(call_id)).maybe_single().execute().data
+    if not call:
+        raise HTTPException(404, "Call not found")
+    if call.get("ended_at"):
+        raise HTTPException(409, "Call is already closed")
+    row = {
+        "call_id": str(call_id),
+        "stage_id": payload.stage_id,
+        "result": payload.result,
+        "prospect_words": payload.prospect_words,
+        "notes": payload.notes,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    response = d.table("call_stage_results").upsert(row, on_conflict="call_id,stage_id").execute()
+    d.table("calls").update({"current_stage_id": payload.stage_id}).eq("id", str(call_id)).execute()
+    if not response.data:
+        raise HTTPException(500, "Could not save stage result")
+    return response.data[0]
+
+@app.patch("/calls/{call_id}/stage")
+def set_current_stage(call_id: UUID, payload: UpdateStage) -> dict[str, Any]:
+    d = db()
+    valid_stages = {s["id"] for s in list_stages()}
+    if payload.stage_id not in valid_stages:
+        raise HTTPException(400, f"Unknown stage_id: {payload.stage_id}")
+    response = d.table("calls").update({"current_stage_id": payload.stage_id}).eq("id", str(call_id)).is_("ended_at", "null").execute()
+    if not response.data:
+        raise HTTPException(404, "Open call not found")
+    return response.data[0]
+
+@app.post("/calls/{call_id}/close")
+def close_call(call_id: UUID, payload: CloseCall) -> dict[str, Any]:
+    d = db()
+    response = d.table("calls").update({
+        "outcome": payload.outcome,
+        "outcome_notes": payload.outcome_notes,
+        "ended_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", str(call_id)).is_("ended_at", "null").execute()
+    if not response.data:
+        raise HTTPException(404, "Open call not found")
+    return response.data[0]
+
+@app.get("/calls")
+def list_calls(limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+    if limit < 1 or limit > 100 or offset < 0:
+        raise HTTPException(400, "limit must be 1-100 and offset must be non-negative")
+    rows = db().table("calls").select("*").order("started_at", desc=True).range(offset, offset + limit - 1).execute().data or []
+    for row in rows:
+        stage_results = db().table("call_stage_results").select("stage_id,result,prospect_words,notes,created_at").eq("call_id", row["id"]).order("created_at").execute().data or []
+        row["stage_results"] = stage_results
+    return rows
+
+@app.get("/calls/{call_id}")
+def get_call(call_id: UUID) -> dict[str, Any]:
+    d = db()
+    row = d.table("calls").select("*").eq("id", str(call_id)).maybe_single().execute().data
+    if not row:
+        raise HTTPException(404, "Call not found")
+    row["stage_results"] = d.table("call_stage_results").select("*").eq("call_id", str(call_id)).order("created_at").execute().data or []
+    return row
+
+
+class AISummaryRequest(BaseModel):
+    refresh: bool = False
+
+@app.post("/calls/{call_id}/ai-summary")
+async def generate_ai_summary(call_id: UUID, payload: AISummaryRequest) -> dict[str, Any]:
+    """Summarize only the caller's saved notes; never generate/alter prospect quotations."""
+    d = db()
+    call = d.table("calls").select("*").eq("id", str(call_id)).maybe_single().execute().data
+    if not call:
+        raise HTTPException(404, "Call not found")
+
+    if call.get("ai_summary") and not payload.refresh:
+        return {"status": "ready", "configured": True, "summary": call["ai_summary"], "cached": True}
+
+    api_key = os.getenv("LLM_API_KEY")
+    api_url = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
+    model = os.getenv("LLM_MODEL", "gpt-4o-mini")
+
+    if not api_key:
+        # Non-failing disabled state message as specified in Task 4
+        return {
+            "status": "disabled",
+            "configured": False,
+            "message": "AI debrief is not configured. Configure LLM_API_KEY on the server to enable post-call AI summaries and objection classification.",
+            "summary": None,
+            "cached": False
+        }
+
+    stage_rows = d.table("call_stage_results").select("stage_id,result,prospect_words,notes,created_at").eq("call_id", str(call_id)).order("created_at").execute().data or []
+    safe_input = {
+        "prospect_name": call.get("prospect_name"),
+        "company_name": call.get("company_name"),
+        "outcome": call.get("outcome"),
+        "outcome_notes": call.get("outcome_notes"),
+        "stages": stage_rows,
+    }
+    system_prompt = (
+        "You are a careful sales-call review assistant. Use ONLY the supplied saved call fields. "
+        "Never invent facts, infer prospect intent beyond the notes, or rewrite/complete direct quotations. "
+        "Summarize the call for the caller, not the prospect. Return valid JSON with keys: "
+        "summary (string), objection_classification (string or null, e.g., 'Vendor Lock-in (Global Contract)', 'Internal Process', 'Timing/Budget', 'Not Relevant', or null), "
+        "signals (array of up to 3 short strings), follow_up (string), and data_gaps (array of short strings). "
+        "If notes are sparse, explicitly state that in the summary."
+    )
+    try:
+        async with httpx.AsyncClient(timeout=25) as client:
+            response = await client.post(
+                api_url,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "temperature": 0.2,
+                    "response_format": {"type": "json_object"},
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": json.dumps(safe_input, ensure_ascii=False)},
+                    ],
+                },
+            )
+            response.raise_for_status()
+            content = response.json()["choices"][0]["message"]["content"]
+            summary = json.loads(content)
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(502, f"LLM provider returned HTTP {exc.response.status_code}") from exc
+    except (httpx.HTTPError, KeyError, IndexError, ValueError, TypeError) as exc:
+        raise HTTPException(502, "Could not generate a valid AI debrief") from exc
+
+    summary["model"] = model
+    summary["generated_at"] = datetime.now(timezone.utc).isoformat()
+    update = d.table("calls").update({"ai_summary": summary}).eq("id", str(call_id)).execute()
+    if not update.data:
+        raise HTTPException(500, "Generated summary but could not save it")
+    return {"status": "ready", "configured": True, "summary": summary, "cached": False}
