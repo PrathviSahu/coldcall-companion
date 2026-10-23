@@ -7,7 +7,6 @@ import {
   Check,
   ChevronRight,
   Clock3,
-  ExternalLink,
   FileText,
   Headphones,
   History,
@@ -59,10 +58,10 @@ const STAGE_SEED = [
       '“Is this a sales call? What are you proposing?”',
     ],
     stage_taps: [
-      'Understood & listening',
-      'Asked what company does',
+      'Asked what we do',
       'Asked where we got number',
-      'Flagged as sales call',
+      'Said it is a sales call',
+      'Let me go on',
     ],
   },
   {
@@ -230,12 +229,21 @@ function formatDate(value) {
   return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' · ' + d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
 }
 
+function formatTimer(totalSec) {
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
 function App() {
   const [stages, setStages] = useState(STAGE_SEED);
   const [screen, setScreen] = useState('call'); // 'call' | 'history' | 'detail'
   const [activeCall, setActiveCall] = useState(null);
   const [activeIndex, setActiveIndex] = useState(0);
   const [fields, setFields] = useState({ prospect_name: '', company_name: '' });
+
+  // Live call timer
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
 
   // Current stage editor state
   const [selectedTap, setSelectedTap] = useState('');
@@ -261,7 +269,7 @@ function App() {
   const [aiBusy, setAiBusy] = useState(false);
   const [aiNotice, setAiNotice] = useState('');
 
-  // Keep a ref to the latest activeCall, stageResults, words, notes, selectedTap to prevent stale closure races
+  // Keep refs to avoid stale closure races during atomic transitions
   const activeCallRef = useRef(activeCall);
   activeCallRef.current = activeCall;
   const stageResultsRef = useRef(stageResults);
@@ -269,7 +277,23 @@ function App() {
   const currentStageRef = useRef({ words, notes, selectedTap, activeIndex });
   currentStageRef.current = { words, notes, selectedTap, activeIndex };
 
-  // Initial load: stages, health, history
+  // Timer loop for active call
+  useEffect(() => {
+    if (!activeCall || activeCall.ended_at) {
+      setElapsedSeconds(0);
+      return;
+    }
+    const startMs = new Date(activeCall.started_at).getTime();
+    const updateTimer = () => {
+      const now = Date.now();
+      setElapsedSeconds(Math.max(0, Math.floor((now - startMs) / 1000)));
+    };
+    updateTimer();
+    const interval = setInterval(updateTimer, 1000);
+    return () => clearInterval(interval);
+  }, [activeCall]);
+
+  // Initial load
   useEffect(() => {
     request('/stages')
       .then(data => {
@@ -341,7 +365,7 @@ function App() {
         );
         setHistory(localOnly);
       } else {
-        setHistoryError(err.message || 'Could not reach backend server.');
+        setHistoryError(err.message || 'Could not connect to backend database.');
       }
     } finally {
       setLoadingHistory(false);
@@ -409,14 +433,14 @@ function App() {
     return updated;
   }
 
-  // Atomic transition: always awaits the save of current stage BEFORE changing activeIndex
+  // Atomic transition: strictly awaits save of active stage BEFORE switching
   async function goToStage(targetIndex) {
     if (busy || savingStage) return;
     const safeIndex = Math.max(0, Math.min(stages.length - 1, targetIndex));
     if (safeIndex === activeIndex) return;
 
     setError('');
-    // 1. Await save of currently open stage
+    // 1. Await save of current stage
     const currentWords = words;
     const currentNotes = notes;
     const currentTap = selectedTap;
@@ -741,252 +765,177 @@ function App() {
               </div>
             ) : (
               <div className="call-layout">
-                {/* Active Call Header */}
-                <div className="call-heading">
-                  <div>
-                    <div className="eyebrow">
-                      <span className="eyebrow-dot live" /> LIVE CALL
-                      <span className="mid-dot">·</span> Started {formatDate(activeCall.started_at)}
-                      {activeCall.isLocal && (
-                        <span className="offline-pill" title="This call is stored in your local browser only">
-                          LOCAL / OFFLINE
-                        </span>
-                      )}
-                    </div>
-                    <h1>
-                      {activeCall.prospect_name || 'Unnamed prospect'}
-                      {activeCall.company_name && (
-                        <span className="company-heading"> · {activeCall.company_name}</span>
-                      )}
-                    </h1>
-                    <p>Listen closely. The companion tracks the structure so you can stay fully present.</p>
-                  </div>
-                  <button className="quiet-button end-btn" onClick={() => setFinishOpen(true)}>
-                    <X size={15} /> End call
-                  </button>
-                </div>
-
-                {/* Eight Stages Progress Stepper */}
-                <div className="progress-strip" role="tablist" aria-label="Stages">
-                  {stages.map((s, i) => {
-                    const isDone = Boolean(stageResults[s.id]?.result);
-                    const isCurrent = i === activeIndex;
-                    return (
-                      <button
-                        key={s.id}
-                        type="button"
-                        role="tab"
-                        aria-selected={isCurrent}
-                        className={`progress-step ${isCurrent ? 'current' : ''} ${isDone ? 'done' : ''}`}
-                        onClick={() => goToStage(i)}
-                        title={`${i + 1}. ${s.title}`}
-                      >
-                        <span>
-                          {isDone ? <Check size={12} /> : String(i + 1).padStart(2, '0')}
-                        </span>
-                        <i />
-                      </button>
-                    );
-                  })}
-                </div>
-
-                {/* Primary Dual Workspace Grid */}
-                <div className="work-grid">
-                  {/* Left Column: Stage Guidance & Utterances */}
-                  <section className="stage-card">
-                    <div className="stage-topline">
-                      <div className="stage-number">
-                        STAGE {String(activeIndex + 1).padStart(2, '0')} <span>OF 08</span>
-                      </div>
-                      <div className="stage-pill">
-                        {stageResults[stage.id] ? 'SAVED' : 'IN PROGRESS'}
-                      </div>
-                    </div>
-
-                    <h2>{stage.title}</h2>
-                    <p className="stage-purpose">{stage.purpose}</p>
-
-                    <div className="section-divider" />
-
-                    <div className="subhead">
-                      <span className="subhead-mark">
-                        <Sparkles size={14} />
+                {/* Reference Screen Centered Container */}
+                <div className="reference-screen-wrapper">
+                  <div className="reference-card-surface">
+                    {/* Top Guide Bar with Live Timer */}
+                    <div className="reference-guide-bar">
+                      <span className="reference-brand-label">
+                        COLDCALL COMPANION · CALL GUIDE
                       </span>
-                      <h3>What to keep in mind</h3>
-                    </div>
-                    <p className="guidance">{stage.guidance}</p>
-
-                    <div className="signal-title">
-                      <span>WHAT YOU MAY HEAR</span>
-                      <span className="soft-tag">Derived from 100 transcripts</span>
+                      <span className="reference-timer-label">
+                        {formatTimer(elapsedSeconds)}
+                      </span>
                     </div>
 
-                    <div className="cue-list">
-                      {(stage.prospect_patterns || []).map((pat, idx) => (
-                        <div className="cue" key={idx}>
-                          <span className="cue-quote">“</span>
-                          <span className="cue-text">{pat.replace(/^“|”$/g, '')}</span>
+                    {/* Prospect Info Header */}
+                    <div className="reference-prospect-bar">
+                      <div className="reference-prospect-name">
+                        {activeCall.prospect_name || 'Unnamed prospect'}
+                      </div>
+                      <div className="reference-prospect-sub">
+                        {activeCall.company_name
+                          ? `${activeCall.company_name} · first call`
+                          : 'First call · outbound conversation'}
+                        {activeCall.isLocal && (
+                          <span className="offline-pill" title="Stored locally in this browser">
+                            LOCAL
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Numbered Stage Stepper 1 - 8 */}
+                    <div className="reference-stepper-bar" role="tablist">
+                      {stages.map((s, i) => {
+                        const isCurrent = i === activeIndex;
+                        const isSaved = Boolean(stageResults[s.id]?.result);
+                        return (
                           <button
+                            key={s.id}
                             type="button"
-                            title="Insert into prospect's words"
-                            onClick={() => {
-                              const clean = pat.replace(/^“|”$/g, '');
-                              setWords(prev => (prev ? `${prev}\n${clean}` : clean));
-                            }}
+                            role="tab"
+                            aria-selected={isCurrent}
+                            className={`reference-step-item ${isCurrent ? 'active' : isSaved ? 'saved' : 'pending'}`}
+                            onClick={() => goToStage(i)}
+                            title={`${i + 1}. ${s.title}`}
                           >
-                            <Plus size={14} />
+                            {i + 1}
                           </button>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
 
-                    {/* Stage Navigation Footer */}
-                    <div className="stage-nav">
-                      <div className="nav-left">
-                        <button
-                          className="quiet-button"
-                          type="button"
-                          disabled={activeIndex === 0 || savingStage}
-                          onClick={() => goToStage(activeIndex - 1)}
-                        >
-                          <ArrowLeft size={15} /> Previous
-                        </button>
-                        <button
-                          className="quiet-button end-call-secondary"
-                          type="button"
-                          onClick={() => setFinishOpen(true)}
-                          title="End conversation from this stage"
-                        >
-                          <X size={14} /> End call
-                        </button>
+                    {/* Stage Details */}
+                    <div className="reference-content-body">
+                      <div className="reference-stage-kicker">
+                        STAGE {activeIndex + 1} OF 8
+                      </div>
+                      <h2 className="reference-stage-title">{stage.title}</h2>
+                      <p className="reference-stage-purpose">{stage.purpose}</p>
+
+                      {/* THEY MAY SAY (Empirical Cues with Blue Accent Left Border) */}
+                      <div className="reference-section-header">THEY MAY SAY</div>
+                      <div className="reference-cues-list">
+                        {(stage.prospect_patterns || []).map((pat, idx) => (
+                          <div className="reference-cue-item" key={idx}>
+                            <span>{pat}</span>
+                            <button
+                              type="button"
+                              title="Append to prospect's words"
+                              onClick={() => {
+                                const clean = pat.replace(/^“|”$/g, '');
+                                setWords(w => (w ? `${w}\n${clean}` : clean));
+                              }}
+                            >
+                              <Plus size={13} />
+                            </button>
+                          </div>
+                        ))}
                       </div>
 
-                      <div className="nav-right">
-                        <button
-                          className="secondary-button"
-                          type="button"
-                          onClick={handleManualSave}
-                          disabled={savingStage}
-                        >
-                          <Check size={15} />
-                          {savingStage ? 'Saving…' : 'Save stage'}
-                        </button>
+                      {/* WHAT HAPPENED (2x2 Taps Grid) */}
+                      <div className="reference-section-header">WHAT HAPPENED</div>
+                      <div className="reference-taps-grid">
+                        {(stage.stage_taps || ['Moved forward', 'Asked question', 'Objection', 'Let me go on']).map((tapText, idx) => {
+                          const isPressed = selectedTap === tapText;
+                          return (
+                            <button
+                              type="button"
+                              key={idx}
+                              className={`reference-tap-button ${isPressed ? 'pressed' : ''}`}
+                              onClick={() => setSelectedTap(tapText)}
+                            >
+                              {tapText}
+                            </button>
+                          );
+                        })}
+                      </div>
 
+                      {/* PROSPECT'S WORDS (HER WORDS) */}
+                      <div className="reference-section-header flex-between">
+                        <span>HER / PROSPECT’S WORDS</span>
+                        {stage.id === 'their_need' ? (
+                          <span className="crucial-callout">STAGE 5: WRITE EXACT WORDS</span>
+                        ) : (
+                          <span className="subtle-callout">AS CLOSE TO VERBATIM AS POSSIBLE</span>
+                        )}
+                      </div>
+                      <textarea
+                        id="prospect-words-input"
+                        className={`reference-textarea ${stage.id === 'their_need' ? 'need-highlight' : ''}`}
+                        value={words}
+                        onChange={e => setWords(e.target.value)}
+                        placeholder="“accounting for what, we already have a CA who files everything…”"
+                        rows={3}
+                        maxLength={10000}
+                      />
+
+                      {/* YOUR PRIVATE NOTES (Optional) */}
+                      <div className="reference-section-header flex-between" style={{ marginTop: '16px' }}>
+                        <span>YOUR NOTES</span>
+                        <span className="subtle-callout">OPTIONAL</span>
+                      </div>
+                      <textarea
+                        id="extra-notes-input"
+                        className="reference-textarea notes-box"
+                        value={notes}
+                        onChange={e => setNotes(e.target.value)}
+                        placeholder="Context, follow-up specifics, timing details to remember…"
+                        rows={2}
+                        maxLength={4000}
+                      />
+
+                      {/* Bottom Controls: NEXT: [STAGE] & END CALL */}
+                      <div className="reference-bottom-actions">
                         {activeIndex < 7 ? (
                           <button
-                            className="primary-button"
                             type="button"
+                            className="reference-next-button"
                             onClick={() => goToStage(activeIndex + 1)}
                             disabled={savingStage}
                           >
-                            <span>Next: {stages[activeIndex + 1]?.title}</span>
+                            <span>NEXT: {stages[activeIndex + 1]?.title?.toUpperCase()}</span>
                             <ArrowRight size={15} />
                           </button>
                         ) : (
                           <button
-                            className="primary-button"
                             type="button"
+                            className="reference-next-button"
                             onClick={() => setFinishOpen(true)}
                           >
-                            <span>Wrap up & Outcome</span>
+                            <span>WRAP UP & OUTCOME</span>
                             <ArrowRight size={15} />
                           </button>
                         )}
-                      </div>
-                    </div>
-                  </section>
 
-                  {/* Right Column: Interactive Quick Taps & Live Notes */}
-                  <section className="notes-card">
-                    <div className="notes-header">
-                      <div className="notes-icon">
-                        <FileText size={16} />
-                      </div>
-                      <div>
-                        <h3>Live Call Capture</h3>
-                        <p>Quick taps reduce typing during conversation.</p>
-                      </div>
-                      <span className="notes-required">STAGE {activeIndex + 1}</span>
-                    </div>
-
-                    {/* What Happened Quick Taps */}
-                    <div className="outcome-label">WHAT HAPPENED AT THIS STAGE?</div>
-                    <div className="result-taps-grid">
-                      {(stage.stage_taps || ['Moved forward', 'Positive response', 'Objection encountered', 'Skipped stage']).map((tapText, idx) => (
                         <button
                           type="button"
-                          key={idx}
-                          onClick={() => setSelectedTap(tapText)}
-                          className={`tap-option ${selectedTap === tapText ? 'active' : ''}`}
+                          className="reference-end-button"
+                          onClick={() => setFinishOpen(true)}
                         >
-                          <span className="tap-radio" />
-                          <span>{tapText}</span>
+                          END CALL
                         </button>
-                      ))}
+                      </div>
                     </div>
-
-                    {/* Verbatim Prospect Words Box */}
-                    <label className="textarea-label" htmlFor="prospect-words-input">
-                      PROSPECT’S OWN WORDS{' '}
-                      {stage.id === 'their_need' ? (
-                        <span className="crucial-label">CRUCIAL · WRITE EXACT WORDS</span>
-                      ) : (
-                        <span>VERBATIM AS CLOSE AS POSSIBLE</span>
-                      )}
-                    </label>
-                    <textarea
-                      id="prospect-words-input"
-                      className={`words-input ${stage.id === 'their_need' ? 'highlight-box' : ''}`}
-                      value={words}
-                      onChange={e => setWords(e.target.value)}
-                      placeholder={
-                        stage.id === 'their_need'
-                          ? '“Our main challenge is factory capacity utilization in the north…”'
-                          : '“We already have a global contract for this…”'
-                      }
-                      maxLength={10000}
-                    />
-
-                    {/* Private Caller Notes */}
-                    <label className="textarea-label notes-label" htmlFor="extra-notes-input">
-                      YOUR PRIVATE NOTES <span>OPTIONAL CONTEXT</span>
-                    </label>
-                    <textarea
-                      id="extra-notes-input"
-                      className="extra-input"
-                      value={notes}
-                      onChange={e => setNotes(e.target.value)}
-                      placeholder="Next step details, gatekeeper names, callback preferences…"
-                      maxLength={4000}
-                    />
-
-                    <div className="notes-bottom">
-                      <span>
-                        <Check size={13} />
-                        {savingStage
-                          ? 'Persisting to storage…'
-                          : stageResults[stage.id]
-                          ? 'Saved (auto-persists on stage move)'
-                          : 'Auto-saves when you move stages'}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={handleManualSave}
-                        disabled={savingStage}
-                        className="save-text"
-                      >
-                        {savingStage ? 'Saving…' : 'Save notes'}
-                        <ArrowRight size={14} />
-                      </button>
-                    </div>
-                  </section>
+                  </div>
                 </div>
 
                 <div className="call-bottomline">
                   <span>
                     <Clock3 size={14} /> {completedCount} of 8 stages logged
                   </span>
-                  <span>Stages auto-persist seamlessly without data loss.</span>
+                  <span>Atomic saves prevent dropped notes when switching stages.</span>
                 </div>
               </div>
             )}
@@ -1280,7 +1229,7 @@ function App() {
                         <span className="stage-reached">
                           {String(Math.max(1, stageIndex + 1)).padStart(2, '0')}
                         </span>{' '}
-                        {st?.title || 'Opening'}
+                        {st?.title?.toUpperCase() || 'OPENING'}
                       </span>
 
                       <span>

@@ -1919,3 +1919,320 @@ button:disabled {
   max-width: 320px;
   line-height: 1.5;
 }
+
+/* ==========================================================================
+   DEEPTHOUGHT REFERENCE SCREEN FIDELITY (READING 2 MATCH)
+   ========================================================================== */
+
+.reference-screen-wrapper {
+  max-width: 480px;
+  width: 100%;
+  margin: 10px auto 20px;
+}
+
+.reference-card-surface {
+  background: #f8fafc;
+  border: 2px solid #0f172a;
+  box-shadow: 8px 8px 0 #0f172a;
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.reference-guide-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid #e2e8f0;
+  background: #ffffff;
+  padding: 12px 16px;
+}
+
+.reference-brand-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: #0029ff;
+}
+
+.reference-timer-label {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: #64748b;
+}
+
+.reference-prospect-bar {
+  border-bottom: 1px solid #e2e8f0;
+  background: #ffffff;
+  padding: 12px 16px;
+}
+
+.reference-prospect-name {
+  font-size: 15px;
+  font-weight: 800;
+  color: #0f172a;
+}
+
+.reference-prospect-sub {
+  font-size: 11px;
+  color: #64748b;
+  margin-top: 2px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.reference-stepper-bar {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  border-bottom: 1px solid #e2e8f0;
+  background: #ffffff;
+  padding: 10px 16px;
+}
+
+.reference-step-item {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  border: 1px solid transparent;
+  transition: 0.15s;
+}
+
+.reference-step-item.active {
+  background: #0029ff;
+  color: #ffffff;
+  border-color: #0029ff;
+}
+
+.reference-step-item.saved {
+  background: #0f172a;
+  color: #ffffff;
+  border-color: #0f172a;
+}
+
+.reference-step-item.pending {
+  background: #ffffff;
+  border-color: #e2e8f0;
+  color: #94a3b8;
+}
+
+.reference-step-item:hover:not(.active) {
+  border-color: #cbd5e1;
+}
+
+.reference-content-body {
+  padding: 18px 16px 20px;
+  background: #f8fafc;
+}
+
+.reference-stage-kicker {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: #94a3b8;
+}
+
+.reference-stage-title {
+  font-size: 24px;
+  font-weight: 900;
+  letter-spacing: -0.03em;
+  color: #0f172a;
+  margin: 4px 0 6px;
+}
+
+.reference-stage-purpose {
+  font-size: 13px;
+  line-height: 1.6;
+  color: #334155;
+  margin: 0;
+}
+
+.reference-section-header {
+  margin-top: 18px;
+  margin-bottom: 8px;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: #94a3b8;
+}
+
+.reference-section-header.flex-between {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.crucial-callout {
+  color: #b91c1c;
+  font-size: 8px;
+  letter-spacing: 0.05em;
+  font-weight: 800;
+}
+
+.subtle-callout {
+  color: #94a3b8;
+  font-size: 8px;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+}
+
+.reference-cues-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.reference-cue-item {
+  border-left: 2px solid #0029ff;
+  background: #ffffff;
+  padding: 8px 12px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #0f172a;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-top: 1px solid #f1f5f9;
+  border-right: 1px solid #f1f5f9;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.reference-cue-item button {
+  background: transparent;
+  border: 0;
+  color: #94a3b8;
+  padding: 4px;
+  display: grid;
+  place-items: center;
+  border-radius: 2px;
+  transition: 0.15s;
+}
+
+.reference-cue-item button:hover {
+  background: #eff6ff;
+  color: #0029ff;
+}
+
+.reference-taps-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.reference-tap-button {
+  padding: 10px 8px;
+  text-align: center;
+  font-size: 11px;
+  font-weight: 700;
+  border: 1px solid #cbd5e1;
+  background: #ffffff;
+  color: #334155;
+  border-radius: 0;
+  transition: all 0.15s ease;
+  line-height: 1.35;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.reference-tap-button:hover {
+  background: #f1f5f9;
+  border-color: #94a3b8;
+}
+
+.reference-tap-button.pressed {
+  background: #0029ff;
+  border-color: #0029ff;
+  color: #ffffff;
+}
+
+.reference-textarea {
+  width: 100%;
+  border: 1px solid #cbd5e1;
+  background: #ffffff;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #0f172a;
+  font-family: inherit;
+  outline: none;
+  resize: vertical;
+  border-radius: 0;
+  transition: border-color 0.15s;
+}
+
+.reference-textarea:focus {
+  border-color: #0029ff;
+}
+
+.reference-textarea.need-highlight {
+  border-color: #93c5fd;
+  background: #fbfdff;
+}
+
+.reference-textarea.notes-box {
+  background: #ffffff;
+  color: #475569;
+  font-size: 11px;
+}
+
+.reference-bottom-actions {
+  margin-top: 20px;
+  display: flex;
+  gap: 8px;
+}
+
+.reference-next-button {
+  flex: 1;
+  background: #0f172a;
+  color: #ffffff;
+  padding: 12px 16px;
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border-radius: 0;
+  transition: background 0.15s;
+}
+
+.reference-next-button:hover:not(:disabled) {
+  background: #0029ff;
+}
+
+.reference-end-button {
+  border: 1px solid #cbd5e1;
+  background: #ffffff;
+  color: #64748b;
+  padding: 12px 14px;
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-radius: 0;
+  transition: all 0.15s;
+}
+
+.reference-end-button:hover {
+  border-color: #0f172a;
+  color: #0f172a;
+}
