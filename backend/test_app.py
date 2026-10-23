@@ -7,7 +7,7 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 import httpx
-from app import app, STARTER_STAGES
+from app import app, STARTER_STAGES, ALLOWED_OUTCOMES
 import app as app_module
 
 # Explicit, high-entropy test tokens (never hardcoded in application runtime)
@@ -266,11 +266,18 @@ class MockSupabaseClient:
                         if getattr(self.client, "_simulate_rpc_failure", False):
                             raise Exception("Simulated PostgreSQL transactional failure during stage write")
 
-                        # Validate incoming finalization parameters
+                        # Validate incoming finalization parameters and outcome
                         p_ended = self.params.get("p_ended_at")
-                        p_outcome = self.params.get("p_outcome")
-                        if p_ended is not None and p_outcome is None:
+                        p_raw_outcome = self.params.get("p_outcome")
+                        clean_outcome = str(p_raw_outcome).strip() if p_raw_outcome is not None and str(p_raw_outcome).strip() else None
+                        if p_raw_outcome is not None and not clean_outcome:
+                            raise Exception("DataIntegrityError: Outcome cannot be blank or whitespace-only")
+                        if clean_outcome and clean_outcome not in ALLOWED_OUTCOMES:
+                            raise Exception(f"DataIntegrityError: Invalid outcome {clean_outcome}")
+                        if p_ended is not None and not clean_outcome:
                             raise Exception("DataIntegrityError: ended_at cannot be set without a valid outcome")
+
+                        effective_ended = p_ended or datetime.now(timezone.utc).isoformat() if clean_outcome else None
 
                         # PostgreSQL transaction scratchpad
                         scratch_calls = [dict(c) for c in self.client.db_state["calls"]]
@@ -298,10 +305,10 @@ class MockSupabaseClient:
                                     raise Exception(f"Conflict: Call {call_id} is already finalized with outcome {existing_call.get('outcome')}")
                                 # Already finalized: preserve outcome, outcome_notes, and ended_at as immutable
                             else:
-                                if self.params.get("p_outcome"):
-                                    existing_call["outcome"] = self.params.get("p_outcome")
+                                if clean_outcome:
+                                    existing_call["outcome"] = clean_outcome
                                     existing_call["outcome_notes"] = self.params.get("p_outcome_notes") or ""
-                                    existing_call["ended_at"] = self.params.get("p_ended_at") or datetime.now(timezone.utc).isoformat()
+                                    existing_call["ended_at"] = effective_ended
                                 if self.params.get("p_current_stage_id"):
                                     existing_call["current_stage_id"] = self.params.get("p_current_stage_id")
                             target_call = existing_call
@@ -315,8 +322,8 @@ class MockSupabaseClient:
                                 "company_name": self.params.get("p_company_name"),
                                 "current_stage_id": self.params.get("p_current_stage_id"),
                                 "started_at": self.params.get("p_started_at") or datetime.now(timezone.utc).isoformat(),
-                                "ended_at": self.params.get("p_ended_at"),
-                                "outcome": self.params.get("p_outcome"),
+                                "ended_at": effective_ended,
+                                "outcome": clean_outcome,
                                 "outcome_notes": self.params.get("p_outcome_notes") or "",
                                 "created_at": datetime.now(timezone.utc).isoformat(),
                                 "ai_summary": None,
@@ -2599,3 +2606,296 @@ def test_real_postgresql_prevent_new_inconsistent_offline_calls():
     assert data4["outcome"] is None
     assert data4["ended_at"] is None
     assert data4["client_call_id"] is None
+
+
+def test_sync_offline_call_rejects_blank_and_whitespace_outcomes():
+    """
+    REGRESSION TEST: Verify that POST /calls/sync-offline strictly rejects
+    blank or whitespace-only outcomes with HTTP 422, never allowing empty strings
+    to bypass outcome validation via truthiness checks.
+    """
+    # Case 1: Empty string outcome
+    payload_empty = {
+        "client_call_id": "blank-outcome-1",
+        "prospect_name": "Blank Prospect",
+        "outcome": "",
+    }
+    res1 = client.post("/calls/sync-offline", json=payload_empty)
+    assert res1.status_code == 422
+    assert "Outcome cannot be blank" in res1.text or "Invalid outcome" in res1.text
+
+    # Case 2: Whitespace-only outcome
+    payload_ws = {
+        "client_call_id": "ws-outcome-2",
+        "prospect_name": "Whitespace Prospect",
+        "outcome": "   ",
+    }
+    res2 = client.post("/calls/sync-offline", json=payload_ws)
+    assert res2.status_code == 422
+    assert "Outcome cannot be blank" in res2.text or "Invalid outcome" in res2.text
+
+
+def test_sync_offline_call_finalized_omitted_ended_at_assigns_server_timestamp(mock_db):
+    """
+    REGRESSION TEST: Verify that when a valid finalized outcome is supplied but
+    ended_at is omitted, the offline sync assigns a consistent server-side timestamp
+    so the call is never left without an end timestamp.
+    """
+    payload = {
+        "client_call_id": "omitted-ended-at-1",
+        "prospect_name": "Omitted Ended At Prospect",
+        "outcome": "meeting_booked",
+        "ended_at": None,
+    }
+    res = client.post("/calls/sync-offline", json=payload)
+    assert res.status_code == 200
+    data = res.json()
+    assert data["outcome"] == "meeting_booked"
+    assert data["ended_at"] is not None
+
+
+def test_real_postgresql_offline_sync_insertion_paths_and_outcomes():
+    """
+    REAL POSTGRESQL TEST: Thoroughly tests both keyed and unkeyed SQL insertion paths in PostgreSQL:
+    1. Keyed insertion with omitted ended_at assigns a non-null server timestamp.
+    2. Keyed insertion with blank/invalid outcome is rejected with 23514 DataIntegrityError.
+    3. Keyed insertion of valid open call preserves NULL ended_at and NULL outcome.
+    4. Unkeyed insertion with omitted ended_at assigns a non-null server timestamp.
+    5. Unkeyed insertion with blank/invalid outcome is rejected with 23514 DataIntegrityError.
+    6. Unkeyed insertion of valid open call preserves NULL ended_at and NULL outcome.
+    Verifies actual database rows in public.calls for all cases.
+    """
+    if not _check_real_postgres():
+        pytest.skip("Local PostgreSQL database coldcall_test not available")
+
+    # Re-apply migrations
+    subprocess.run([PSQL_BIN, "-d", "coldcall_test", "-f", "supabase/migrations/20261023_secure_sync_offline_rpc.sql"], capture_output=True, text=True)
+
+    # 1. KEYED PATH: Valid finalized call with omitted ended_at
+    keyed_omitted_id = f"pg-keyed-omit-{uuid4()}"
+    cmd_k1 = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SELECT public.sync_offline_call_transaction(
+          'rep-alpha',
+          '{keyed_omitted_id}',
+          'Keyed Omitted Ended',
+          'Keyed Corp',
+          'opening',
+          NOW(),
+          NULL,
+          'meeting_booked',
+          'Meeting scheduled without client timestamp',
+          '[]'::jsonb
+        );
+        """
+    ]
+    r_k1 = subprocess.run(cmd_k1, capture_output=True, text=True)
+    assert r_k1.returncode == 0, f"Failed: {r_k1.stderr}"
+    data_k1 = json.loads(r_k1.stdout.strip())
+    assert data_k1["outcome"] == "meeting_booked"
+    assert data_k1["ended_at"] is not None
+
+    # Verify directly in PostgreSQL row
+    chk_k1 = subprocess.run(
+        [PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+         f"SELECT outcome, (ended_at IS NOT NULL) FROM public.calls WHERE client_call_id = '{keyed_omitted_id}';"],
+        capture_output=True, text=True
+    )
+    outcome_k1, has_ended_k1 = chk_k1.stdout.strip().split("|")
+    assert outcome_k1 == "meeting_booked"
+    assert has_ended_k1 == "t"
+
+    # 2. KEYED PATH: Blank outcome ("")
+    keyed_blank_id = f"pg-keyed-blank-{uuid4()}"
+    cmd_k2 = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SELECT public.sync_offline_call_transaction(
+          'rep-alpha',
+          '{keyed_blank_id}',
+          'Keyed Blank Outcome',
+          'Blank Corp',
+          'opening',
+          NOW(),
+          NOW(),
+          '',
+          'Blank outcome note',
+          '[]'::jsonb
+        );
+        """
+    ]
+    r_k2 = subprocess.run(cmd_k2, capture_output=True, text=True)
+    assert r_k2.returncode != 0
+    assert "DataIntegrityError" in r_k2.stderr
+    assert "Outcome cannot be blank" in r_k2.stderr
+
+    # Verify 0 rows in database
+    chk_k2 = subprocess.run(
+        [PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+         f"SELECT count(*) FROM public.calls WHERE client_call_id = '{keyed_blank_id}';"],
+        capture_output=True, text=True
+    )
+    assert chk_k2.stdout.strip() == "0"
+
+    # 3. KEYED PATH: Invalid outcome ('fake_random_status')
+    keyed_inv_id = f"pg-keyed-inv-{uuid4()}"
+    cmd_k3 = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SELECT public.sync_offline_call_transaction(
+          'rep-alpha',
+          '{keyed_inv_id}',
+          'Keyed Invalid Outcome',
+          'Inv Corp',
+          'opening',
+          NOW(),
+          NOW(),
+          'fake_random_status',
+          'Invalid outcome note',
+          '[]'::jsonb
+        );
+        """
+    ]
+    r_k3 = subprocess.run(cmd_k3, capture_output=True, text=True)
+    assert r_k3.returncode != 0
+    assert "DataIntegrityError" in r_k3.stderr
+    assert "Invalid outcome" in r_k3.stderr
+
+    # 4. KEYED PATH: Valid open call (both outcome and ended_at NULL)
+    keyed_open_id = f"pg-keyed-open-{uuid4()}"
+    cmd_k4 = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SELECT public.sync_offline_call_transaction(
+          'rep-alpha',
+          '{keyed_open_id}',
+          'Keyed Open Call',
+          'Open Corp',
+          'opening',
+          NOW(),
+          NULL,
+          NULL,
+          '',
+          '[]'::jsonb
+        );
+        """
+    ]
+    r_k4 = subprocess.run(cmd_k4, capture_output=True, text=True)
+    assert r_k4.returncode == 0
+    chk_k4 = subprocess.run(
+        [PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+         f"SELECT (outcome IS NULL), (ended_at IS NULL) FROM public.calls WHERE client_call_id = '{keyed_open_id}';"],
+        capture_output=True, text=True
+    )
+    assert chk_k4.stdout.strip() == "t|t"
+
+    # 5. UNKEYED PATH: Valid finalized call with omitted ended_at
+    cmd_u1 = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SELECT public.sync_offline_call_transaction(
+          'rep-alpha',
+          NULL,
+          'Unkeyed Omitted Ended',
+          'Unkeyed Corp',
+          'permission',
+          NOW(),
+          NULL,
+          'next_step_agreed',
+          'Unkeyed finalized without timestamp',
+          '[]'::jsonb
+        );
+        """
+    ]
+    r_u1 = subprocess.run(cmd_u1, capture_output=True, text=True)
+    assert r_u1.returncode == 0
+    data_u1 = json.loads(r_u1.stdout.strip())
+    u1_call_id = data_u1["id"]
+    assert data_u1["outcome"] == "next_step_agreed"
+    assert data_u1["ended_at"] is not None
+
+    # Verify directly in PostgreSQL row
+    chk_u1 = subprocess.run(
+        [PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+         f"SELECT outcome, (ended_at IS NOT NULL) FROM public.calls WHERE id = '{u1_call_id}';"],
+        capture_output=True, text=True
+    )
+    outcome_u1, has_ended_u1 = chk_u1.stdout.strip().split("|")
+    assert outcome_u1 == "next_step_agreed"
+    assert has_ended_u1 == "t"
+
+    # 6. UNKEYED PATH: Blank outcome ('   ')
+    cmd_u2 = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SELECT public.sync_offline_call_transaction(
+          'rep-alpha',
+          NULL,
+          'Unkeyed Blank Outcome',
+          'Unkeyed Blank Corp',
+          'opening',
+          NOW(),
+          NOW(),
+          '   ',
+          'Blank note',
+          '[]'::jsonb
+        );
+        """
+    ]
+    r_u2 = subprocess.run(cmd_u2, capture_output=True, text=True)
+    assert r_u2.returncode != 0
+    assert "DataIntegrityError" in r_u2.stderr
+    assert "Outcome cannot be blank" in r_u2.stderr
+
+    # 7. UNKEYED PATH: Invalid outcome ('invalid_choice')
+    cmd_u3 = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SELECT public.sync_offline_call_transaction(
+          'rep-alpha',
+          NULL,
+          'Unkeyed Invalid Outcome',
+          'Unkeyed Inv Corp',
+          'opening',
+          NOW(),
+          NOW(),
+          'invalid_choice',
+          'Inv note',
+          '[]'::jsonb
+        );
+        """
+    ]
+    r_u3 = subprocess.run(cmd_u3, capture_output=True, text=True)
+    assert r_u3.returncode != 0
+    assert "DataIntegrityError" in r_u3.stderr
+    assert "Invalid outcome" in r_u3.stderr
+
+    # 8. UNKEYED PATH: Valid open call (both outcome and ended_at NULL)
+    cmd_u4 = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SELECT public.sync_offline_call_transaction(
+          'rep-alpha',
+          NULL,
+          'Unkeyed Open Call',
+          'Unkeyed Open Corp',
+          'opening',
+          NOW(),
+          NULL,
+          NULL,
+          '',
+          '[]'::jsonb
+        );
+        """
+    ]
+    r_u4 = subprocess.run(cmd_u4, capture_output=True, text=True)
+    assert r_u4.returncode == 0
+    data_u4 = json.loads(r_u4.stdout.strip())
+    u4_call_id = data_u4["id"]
+    chk_u4 = subprocess.run(
+        [PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+         f"SELECT (outcome IS NULL), (ended_at IS NULL) FROM public.calls WHERE id = '{u4_call_id}';"],
+        capture_output=True, text=True
+    )
+    assert chk_u4.stdout.strip() == "t|t"

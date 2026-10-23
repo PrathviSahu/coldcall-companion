@@ -50,6 +50,8 @@ declare
   v_notes pg_catalog.text;
   v_result_json pg_catalog.jsonb;
   v_clean_client_id pg_catalog.text;
+  v_clean_outcome pg_catalog.text;
+  v_effective_ended_at pg_catalog.timestamptz;
 begin
   -- Normalize client_call_id: nullify empty or whitespace strings
   v_clean_client_id := null;
@@ -57,12 +59,47 @@ begin
     v_clean_client_id := trim(p_client_call_id);
   end if;
 
+  -- Validate and normalize outcome: reject blank/whitespace or invalid outcomes
+  v_clean_outcome := null;
+  if p_outcome is not null then
+    if trim(p_outcome) = '' then
+      raise exception 'DataIntegrityError: Outcome cannot be blank or whitespace-only'
+        using errcode = '23514';
+    end if;
+    v_clean_outcome := trim(p_outcome);
+    if v_clean_outcome not in (
+      'meeting_booked',
+      'next_step_agreed',
+      'agreed_to_receive_report',
+      'follow_up',
+      'interested',
+      'not_interested',
+      'do_not_call',
+      'wrong_person',
+      'moved_company',
+      'no_answer',
+      'other'
+    ) then
+      raise exception 'DataIntegrityError: Invalid outcome %', v_clean_outcome
+        using errcode = '23514';
+    end if;
+  end if;
+
   -- Validate incoming finalization parameters:
-  -- Reject requests where ended_at is provided but outcome is null.
+  -- Reject requests where ended_at is provided but outcome is null or blank.
   -- Valid open calls must have both ended_at and outcome as null.
-  if p_ended_at is not null and p_outcome is null then
+  if p_ended_at is not null and v_clean_outcome is null then
     raise exception 'DataIntegrityError: ended_at cannot be set without a valid outcome'
       using errcode = '23514';
+  end if;
+
+  -- Determine effective ended_at:
+  -- If finalizing (v_clean_outcome is not null), ensure a non-null ended_at timestamp.
+  -- If ended_at was omitted, assign pg_catalog.now().
+  -- If open call (v_clean_outcome is null), ended_at remains null.
+  v_effective_ended_at := null;
+  if v_clean_outcome is not null then
+    v_effective_ended_at := coalesce(p_ended_at, pg_catalog.now());
   end if;
 
   -- 1. Idempotency & Concurrency: If client_call_id is present, serialize and look up
@@ -87,7 +124,7 @@ begin
 
         -- Check if already finalized
         if v_call.outcome is not null then
-          if p_outcome is not null and v_call.outcome <> p_outcome then
+          if v_clean_outcome is not null and v_call.outcome <> v_clean_outcome then
             raise exception 'Conflict: Call % is already finalized with outcome %', v_call_id, v_call.outcome
               using errcode = '23505';
           end if;
@@ -95,9 +132,9 @@ begin
           -- Do NOT overwrite them on matching outcome retries.
         else
           -- Call is open: if outcome provided, finalize it now; otherwise update progress
-          if p_outcome is not null then
+          if v_clean_outcome is not null then
             update public.calls
-            set outcome = p_outcome,
+            set outcome = v_clean_outcome,
                 outcome_notes = coalesce(p_outcome_notes, outcome_notes),
                 ended_at = coalesce(p_ended_at, pg_catalog.now()),
                 current_stage_id = coalesce(p_current_stage_id, current_stage_id)
@@ -111,8 +148,14 @@ begin
         exit;
       else
         begin
-          -- Defensive check before keyed insert
-          if p_ended_at is not null and p_outcome is null then
+          -- Defensive checks before keyed insert:
+          -- Finalized call requires non-null ended_at and valid outcome;
+          -- open call requires both ended_at and outcome to be null.
+          if v_clean_outcome is not null and v_effective_ended_at is null then
+            raise exception 'DataIntegrityError: finalized call must have non-null ended_at'
+              using errcode = '23514';
+          end if;
+          if v_clean_outcome is null and (v_effective_ended_at is not null or p_ended_at is not null) then
             raise exception 'DataIntegrityError: cannot insert call with ended_at set but outcome null'
               using errcode = '23514';
           end if;
@@ -122,7 +165,8 @@ begin
             current_stage_id, started_at, ended_at, outcome, outcome_notes
           ) values (
             p_caller_id, v_clean_client_id, p_prospect_name, p_company_name,
-            p_current_stage_id, coalesce(p_started_at, pg_catalog.now()), p_ended_at, p_outcome, p_outcome_notes
+            p_current_stage_id, coalesce(p_started_at, pg_catalog.now()),
+            v_effective_ended_at, v_clean_outcome, p_outcome_notes
           ) returning id into v_call_id;
           exit;
         exception when unique_violation then
@@ -133,8 +177,14 @@ begin
     end loop;
   else
     -- Deliberate null client_call_id path: creates an unkeyed call record
-    -- Defensive check before unkeyed insert
-    if p_ended_at is not null and p_outcome is null then
+    -- Defensive checks before unkeyed insert:
+    -- Finalized call requires non-null ended_at and valid outcome;
+    -- open call requires both ended_at and outcome to be null.
+    if v_clean_outcome is not null and v_effective_ended_at is null then
+      raise exception 'DataIntegrityError: finalized call must have non-null ended_at'
+        using errcode = '23514';
+    end if;
+    if v_clean_outcome is null and (v_effective_ended_at is not null or p_ended_at is not null) then
       raise exception 'DataIntegrityError: cannot insert call with ended_at set but outcome null'
         using errcode = '23514';
     end if;
@@ -144,7 +194,8 @@ begin
       current_stage_id, started_at, ended_at, outcome, outcome_notes
     ) values (
       p_caller_id, null, p_prospect_name, p_company_name,
-      p_current_stage_id, coalesce(p_started_at, pg_catalog.now()), p_ended_at, p_outcome, p_outcome_notes
+      p_current_stage_id, coalesce(p_started_at, pg_catalog.now()),
+      v_effective_ended_at, v_clean_outcome, p_outcome_notes
     ) returning id into v_call_id;
   end if;
 

@@ -307,7 +307,12 @@ class SyncOfflineCall(BaseModel):
 
     @model_validator(mode="after")
     def validate_finalization_consistency(self) -> Self:
-        if self.ended_at is not None and self.outcome is None:
+        clean_outcome = self.outcome.strip() if self.outcome is not None and self.outcome.strip() else None
+        if self.outcome is not None and not clean_outcome:
+            raise ValueError("Outcome cannot be blank or whitespace-only")
+        if clean_outcome and clean_outcome not in ALLOWED_OUTCOMES:
+            raise ValueError(f"Invalid outcome: '{self.outcome}'. Must be one of: {sorted(ALLOWED_OUTCOMES)}")
+        if self.ended_at is not None and not clean_outcome:
             raise ValueError("Inconsistent call state: ended_at cannot be set without a valid outcome")
         return self
 
@@ -637,8 +642,14 @@ def sync_offline_call(
             )
         seen_stages.add(sr.stage_id)
 
-    # 3. Pre-validate outcome if provided
-    if payload.outcome and payload.outcome not in ALLOWED_OUTCOMES:
+    # 3. Pre-validate outcome: reject blank/whitespace or invalid outcomes
+    clean_outcome = payload.outcome.strip() if payload.outcome is not None and payload.outcome.strip() else None
+    if payload.outcome is not None and not clean_outcome:
+        raise HTTPException(
+            status_code=422,
+            detail="Outcome cannot be blank or whitespace-only"
+        )
+    if clean_outcome and clean_outcome not in ALLOWED_OUTCOMES:
         raise HTTPException(
             status_code=422,
             detail=f"Invalid outcome: '{payload.outcome}'. Must be one of: {sorted(ALLOWED_OUTCOMES)}"
@@ -652,7 +663,7 @@ def sync_offline_call(
         )
 
     # 4b. Pre-validate finalization state consistency
-    if payload.ended_at is not None and payload.outcome is None:
+    if payload.ended_at is not None and not clean_outcome:
         raise HTTPException(
             status_code=422,
             detail="Inconsistent call state: ended_at cannot be set without a valid outcome"
@@ -678,7 +689,7 @@ def sync_offline_call(
             "p_current_stage_id": current_stage,
             "p_started_at": started_at_str,
             "p_ended_at": ended_at_str,
-            "p_outcome": payload.outcome,
+            "p_outcome": clean_outcome,
             "p_outcome_notes": payload.outcome_notes,
             "p_stage_results": stages_json,
         }).execute()
