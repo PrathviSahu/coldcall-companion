@@ -12,6 +12,7 @@ import {
   History,
   MessageSquare,
   Phone,
+  PhoneOff,
   Plus,
   RefreshCw,
   Search,
@@ -729,180 +730,219 @@ function App() {
                 </form>
               </div>
             ) : (
-              <div className="call-layout">
-                {/* Reference Screen Centered Container */}
-                <div className="reference-screen-wrapper">
-                  <div className="reference-card-surface">
-                    {/* Top Guide Bar with Live Timer */}
-                    <div className="reference-guide-bar">
-                      <span className="reference-brand-label">
-                        COLDCALL COMPANION · CALL GUIDE
-                      </span>
-                      <span className="reference-timer-label">
-                        {formatTimer(elapsedSeconds)}
-                      </span>
+              <div className="lc-workspace">
+                {/* ── LIVE CALL HEADER BAR ── */}
+                <div className="lc-header">
+                  <div className="lc-header-left">
+                    <div className="lc-live-badge">
+                      <span className="lc-live-dot" />
+                      LIVE
                     </div>
-
-                    {/* Prospect Info Header */}
-                    <div className="reference-prospect-bar">
-                      <div className="reference-prospect-name">
+                    <div className="lc-prospect-block">
+                      <span className="lc-prospect-name">
                         {activeCall.prospect_name || 'Unnamed prospect'}
-                      </div>
-                      <div className="reference-prospect-sub">
-                        {activeCall.company_name
-                          ? `${activeCall.company_name} · first call`
-                          : 'First call · outbound conversation'}
-                        {activeCall.isLocal && (
-                          <span className="offline-pill" title="Stored locally in this browser">
-                            LOCAL
-                          </span>
-                        )}
-                      </div>
+                      </span>
+                      {activeCall.company_name && (
+                        <span className="lc-company-name">{activeCall.company_name}</span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="lc-header-center">
+                    <span className="lc-timer">{formatTimer(elapsedSeconds)}</span>
+                    <span className="lc-timer-label">ELAPSED</span>
+                  </div>
+                  <div className="lc-header-right">
+                    {activeCall.isLocal ? (
+                      <span className="lc-conn-badge lc-conn-local">
+                        <span className="lc-conn-dot" style={{background:'#c7a75c'}} /> LOCAL ONLY
+                      </span>
+                    ) : apiState === 'connected' ? (
+                      <span className="lc-conn-badge lc-conn-synced">
+                        <span className="lc-conn-dot" style={{background:'#5ea874'}} /> SYNCED
+                      </span>
+                    ) : (
+                      <span className="lc-conn-badge lc-conn-offline">
+                        <span className="lc-conn-dot" style={{background:'#d18b78'}} /> OFFLINE
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      className="lc-end-header-btn"
+                      onClick={() => setFinishOpen(true)}
+                      aria-label="End call"
+                    >
+                      <PhoneOff size={13} />
+                      END CALL
+                    </button>
+                  </div>
+                </div>
+
+                {/* ── STAGE PROGRESS RAIL ── */}
+                <div className="lc-stage-rail" role="tablist">
+                  {stages.map((s, i) => {
+                    const isCurrent = i === activeIndex;
+                    const isSaved = Boolean(stageResults[s.id]?.result);
+                    return (
+                      <button
+                        key={s.id}
+                        type="button"
+                        role="tab"
+                        aria-selected={isCurrent}
+                        disabled={savingStage && !isCurrent}
+                        className={`lc-stage-pip ${isCurrent ? 'current' : isSaved ? 'done' : 'pending'}`}
+                        onClick={() => goToStage(i)}
+                        title={`${i + 1}. ${s.title}`}
+                      >
+                        <span className="lc-pip-num">{i + 1}</span>
+                        <span className="lc-pip-label">{s.title}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* ── MAIN TWO-COLUMN AREA ── */}
+                <div className="lc-body">
+
+                  {/* ── LEFT COLUMN: Stage guidance + quick taps ── */}
+                  <div className="lc-left">
+                    <div className="lc-stage-intro">
+                      <div className="lc-stage-kicker">STAGE {activeIndex + 1} OF 8</div>
+                      <h2 className="lc-stage-title">{stage.title}</h2>
+                      <p className="lc-stage-purpose">{stage.purpose}</p>
+                      {stage.guidance && (
+                        <p className="lc-stage-guidance">{stage.guidance}</p>
+                      )}
                     </div>
 
-                    {/* Numbered Stage Stepper 1 - 8 */}
-                    <div className="reference-stepper-bar" role="tablist">
-                      {stages.map((s, i) => {
-                        const isCurrent = i === activeIndex;
-                        const isSaved = Boolean(stageResults[s.id]?.result);
+                    <div className="lc-section-label">THEY MAY SAY</div>
+                    <div className="lc-cues-list">
+                      {(stage.prospect_patterns || []).map((pat, idx) => (
+                        <div className="lc-cue-row" key={idx}>
+                          <span>{pat}</span>
+                          <button
+                            type="button"
+                            className="lc-cue-append"
+                            title="Append to prospect's words"
+                            onClick={() => setWords(w => w ? w + ' ' + pat : pat)}
+                          >
+                            +
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+
+                    <div className="lc-section-label lc-section-label--mt">WHAT HAPPENED</div>
+                    <div className="lc-taps-grid">
+                      {(stage.stage_taps || []).map((tapText, idx) => {
+                        const isPressed = selectedTap === tapText;
                         return (
                           <button
-                            key={s.id}
+                            key={idx}
                             type="button"
-                            role="tab"
-                            aria-selected={isCurrent}
-                            className={`reference-step-item ${isCurrent ? 'active' : isSaved ? 'saved' : 'pending'}`}
-                            onClick={() => goToStage(i)}
-                            title={`${i + 1}. ${s.title}`}
+                            className={`lc-tap-btn ${isPressed ? 'pressed' : ''}`}
+                            onClick={() => setSelectedTap(tapText)}
                           >
-                            {i + 1}
+                            {tapText}
                           </button>
                         );
                       })}
                     </div>
 
-                    {/* Stage Details */}
-                    <div className="reference-content-body">
-                      <div className="reference-stage-kicker">
-                        STAGE {activeIndex + 1} OF 8
+                    {savingStage && (
+                      <div className="lc-saving-bar">
+                        <RefreshCw size={11} className="spin-icon" /> Saving stage…
                       </div>
-                      <h2 className="reference-stage-title">{stage.title}</h2>
-                      <p className="reference-stage-purpose">{stage.purpose}</p>
+                    )}
 
-                      {/* THEY MAY SAY (Empirical Cues with Blue Accent Left Border) */}
-                      <div className="reference-section-header">THEY MAY SAY</div>
-                      <div className="reference-cues-list">
-                        {(stage.prospect_patterns || []).map((pat, idx) => (
-                          <div className="reference-cue-item" key={idx}>
-                            <span>{pat}</span>
-                            <button
-                              type="button"
-                              title="Append to prospect's words"
-                              onClick={() => {
-                                const clean = pat.replace(/^“|”$/g, '');
-                                setWords(w => (w ? `${w}\n${clean}` : clean));
-                              }}
-                            >
-                              <Plus size={13} />
-                            </button>
-                          </div>
-                        ))}
-                      </div>
+                    {/* Bottom nav controls */}
+                    <div className="lc-nav-actions">
+                      {activeIndex > 0 && (
+                        <button
+                          type="button"
+                          className="lc-prev-btn"
+                          onClick={() => goToStage(activeIndex - 1)}
+                          disabled={savingStage}
+                          title={`Back to ${stages[activeIndex - 1]?.title}`}
+                        >
+                          <ArrowLeft size={14} /> {stages[activeIndex - 1]?.title?.toUpperCase()}
+                        </button>
+                      )}
+                      {activeIndex < 7 ? (
+                        <button
+                          type="button"
+                          className="lc-next-btn"
+                          onClick={() => goToStage(activeIndex + 1)}
+                          disabled={savingStage}
+                        >
+                          NEXT: {stages[activeIndex + 1]?.title?.toUpperCase()} <ArrowRight size={14} />
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className="lc-next-btn"
+                          onClick={() => setFinishOpen(true)}
+                        >
+                          WRAP UP &amp; OUTCOME <ArrowRight size={14} />
+                        </button>
+                      )}
+                    </div>
+                  </div>
 
-                      {/* WHAT HAPPENED (2x2 Taps Grid) */}
-                      <div className="reference-section-header">WHAT HAPPENED</div>
-                      <div className="reference-taps-grid">
-                        {(stage.stage_taps || ['Moved forward', 'Asked question', 'Objection', 'Let me go on']).map((tapText, idx) => {
-                          const isPressed = selectedTap === tapText;
-                          return (
-                            <button
-                              type="button"
-                              key={idx}
-                              className={`reference-tap-button ${isPressed ? 'pressed' : ''}`}
-                              onClick={() => setSelectedTap(tapText)}
-                            >
-                              {tapText}
-                            </button>
-                          );
-                        })}
-                      </div>
-
-                      {/* PROSPECT'S WORDS (HER WORDS) */}
-                      <div className="reference-section-header flex-between">
-                        <span>HER / PROSPECT’S WORDS</span>
-                        {stage.id === 'their_need' ? (
-                          <span className="crucial-callout">STAGE 5: WRITE EXACT WORDS</span>
-                        ) : (
-                          <span className="subtle-callout">AS CLOSE TO VERBATIM AS POSSIBLE</span>
+                  {/* ── RIGHT COLUMN: Verbatim words + caller notes ── */}
+                  <div className="lc-right">
+                    <div className="lc-right-section lc-words-section">
+                      <div className="lc-right-label lc-words-label">
+                        <span>
+                          {stage.id === 'their_need' ? (
+                            <>STAGE 5 · EXACT WORDS <span className="lc-critical-flag">★ VERBATIM</span></>
+                          ) : (
+                            'HER / PROSPECT\'S WORDS'
+                          )}
+                        </span>
+                        {stage.id !== 'their_need' && (
+                          <span className="lc-right-sublabel">AS CLOSE TO VERBATIM AS POSSIBLE</span>
                         )}
                       </div>
                       <textarea
                         id="prospect-words-input"
-                        className={`reference-textarea ${stage.id === 'their_need' ? 'need-highlight' : ''}`}
+                        className={`lc-textarea lc-words-textarea ${stage.id === 'their_need' ? 'verbatim-highlight' : ''}`}
                         value={words}
                         onChange={e => setWords(e.target.value)}
-                        placeholder="“accounting for what, we already have a CA who files everything…”"
-                        rows={3}
+                        placeholder={stage.id === 'their_need'
+                          ? 'Write their exact words here — do not paraphrase…'
+                          : '"accounting for what, we already have a CA who files everything…"'}
                         maxLength={10000}
                       />
+                    </div>
 
-                      {/* YOUR PRIVATE NOTES (Optional) */}
-                      <div className="reference-section-header flex-between" style={{ marginTop: '16px' }}>
+                    <div className="lc-right-section">
+                      <div className="lc-right-label">
                         <span>YOUR NOTES</span>
-                        <span className="subtle-callout">OPTIONAL</span>
+                        <span className="lc-right-sublabel">PRIVATE · OPTIONAL</span>
                       </div>
                       <textarea
                         id="extra-notes-input"
-                        className="reference-textarea notes-box"
+                        className="lc-textarea lc-notes-textarea"
                         value={notes}
                         onChange={e => setNotes(e.target.value)}
                         placeholder="Context, follow-up specifics, timing details to remember…"
-                        rows={2}
                         maxLength={4000}
                       />
+                    </div>
 
-                      {/* Bottom Controls: NEXT: [STAGE] & END CALL */}
-                      <div className="reference-bottom-actions">
-                        {activeIndex < 7 ? (
-                          <button
-                            type="button"
-                            className="reference-next-button"
-                            onClick={() => goToStage(activeIndex + 1)}
-                            disabled={savingStage}
-                          >
-                            <span>NEXT: {stages[activeIndex + 1]?.title?.toUpperCase()}</span>
-                            <ArrowRight size={15} />
-                          </button>
-                        ) : (
-                          <button
-                            type="button"
-                            className="reference-next-button"
-                            onClick={() => setFinishOpen(true)}
-                          >
-                            <span>WRAP UP & OUTCOME</span>
-                            <ArrowRight size={15} />
-                          </button>
-                        )}
-
-                        <button
-                          type="button"
-                          className="reference-end-button"
-                          onClick={() => setFinishOpen(true)}
-                        >
-                          END CALL
-                        </button>
-                      </div>
+                    <div className="lc-progress-line">
+                      <Clock3 size={12} />
+                      <span>{completedCount} of 8 stages logged</span>
+                      {completedCount > 0 && (
+                        <div className="lc-progress-track">
+                          <div className="lc-progress-fill" style={{width: `${(completedCount/8)*100}%`}} />
+                        </div>
+                      )}
                     </div>
                   </div>
                 </div>
-
-                <div className="call-bottomline">
-                  <span>
-                    <Clock3 size={14} /> {completedCount} of 8 stages logged
-                  </span>
-                  <span>Atomic saves prevent dropped notes when switching stages.</span>
-                </div>
               </div>
+
             )}
           </section>
         )}
