@@ -1,3 +1,5 @@
+import concurrent.futures
+import threading
 from datetime import datetime, timezone
 import json
 import os
@@ -196,6 +198,7 @@ class MockSupabaseClient:
             "call_stage_results": [],
         }
         self._simulate_rpc_failure = False
+        self._lock = threading.Lock()
 
     def table(self, name: str):
         return MockTableQuery(name, self.db_state)
@@ -212,84 +215,98 @@ class MockSupabaseClient:
                     def __init__(self, data):
                         self.data = data
 
+                if getattr(self.client, "_simulate_missing_rpc", False):
+                    raise Exception("function sync_offline_call_transaction does not exist")
+
                 if self.fn == "sync_offline_call_transaction":
-                    if getattr(self.client, "_simulate_rpc_failure", False):
-                        raise Exception("Simulated PostgreSQL transactional failure during stage write")
+                    with getattr(self.client, "_lock", threading.Lock()):
+                        if getattr(self.client, "_simulate_rpc_failure", False):
+                            raise Exception("Simulated PostgreSQL transactional failure during stage write")
 
-                    caller_id = self.params.get("p_caller_id")
-                    client_call_id = self.params.get("p_client_call_id")
-                    calls = self.client.db_state["calls"]
-                    stage_results_table = self.client.db_state["call_stage_results"]
+                        # PostgreSQL transaction scratchpad
+                        scratch_calls = [dict(c) for c in self.client.db_state["calls"]]
+                        scratch_stages = [dict(s) for s in self.client.db_state["call_stage_results"]]
 
-                    existing_call = None
-                    if client_call_id:
-                        for c in calls:
-                            if c.get("caller_id") == caller_id and c.get("client_call_id") == client_call_id:
-                                existing_call = c
-                                break
+                        caller_id = self.params.get("p_caller_id")
+                        client_call_id = self.params.get("p_client_call_id")
 
-                    if existing_call:
-                        call_id = existing_call["id"]
-                        if self.params.get("p_outcome"):
-                            if existing_call.get("outcome") and existing_call.get("outcome") != self.params.get("p_outcome"):
-                                raise Exception(f"Conflict: Call {call_id} is already finalized with outcome {existing_call.get('outcome')}")
-                            existing_call["outcome"] = self.params.get("p_outcome")
-                            existing_call["outcome_notes"] = self.params.get("p_outcome_notes") or ""
-                            if self.params.get("p_ended_at"):
-                                existing_call["ended_at"] = self.params.get("p_ended_at")
-                        target_call = existing_call
-                    else:
-                        call_id = str(uuid4())
-                        target_call = {
-                            "id": call_id,
-                            "caller_id": caller_id,
-                            "client_call_id": client_call_id,
-                            "prospect_name": self.params.get("p_prospect_name"),
-                            "company_name": self.params.get("p_company_name"),
-                            "current_stage_id": self.params.get("p_current_stage_id"),
-                            "started_at": self.params.get("p_started_at") or datetime.now(timezone.utc).isoformat(),
-                            "ended_at": self.params.get("p_ended_at"),
-                            "outcome": self.params.get("p_outcome"),
-                            "outcome_notes": self.params.get("p_outcome_notes") or "",
-                            "created_at": datetime.now(timezone.utc).isoformat(),
-                            "ai_summary": None,
-                        }
-                        calls.append(target_call)
+                        existing_call = None
+                        if client_call_id:
+                            for c in scratch_calls:
+                                if c.get("caller_id") == caller_id and c.get("client_call_id") == client_call_id:
+                                    existing_call = c
+                                    break
 
-                    stages = self.params.get("p_stage_results") or []
-                    for sr in stages:
-                        st_id = sr.get("stage_id")
-                        res = sr.get("result", "completed")
-                        words = sr.get("prospect_words", "")
-                        notes = sr.get("notes", "")
+                        if existing_call:
+                            call_id = existing_call["id"]
+                            if self.params.get("p_outcome"):
+                                if existing_call.get("outcome") and existing_call.get("outcome") != self.params.get("p_outcome"):
+                                    raise Exception(f"Conflict: Call {call_id} is already finalized with outcome {existing_call.get('outcome')}")
+                                existing_call["outcome"] = self.params.get("p_outcome")
+                                existing_call["outcome_notes"] = self.params.get("p_outcome_notes") or ""
+                                if self.params.get("p_ended_at"):
+                                    existing_call["ended_at"] = self.params.get("p_ended_at")
+                            target_call = existing_call
+                        else:
+                            call_id = str(uuid4())
+                            target_call = {
+                                "id": call_id,
+                                "caller_id": caller_id,
+                                "client_call_id": client_call_id,
+                                "prospect_name": self.params.get("p_prospect_name"),
+                                "company_name": self.params.get("p_company_name"),
+                                "current_stage_id": self.params.get("p_current_stage_id"),
+                                "started_at": self.params.get("p_started_at") or datetime.now(timezone.utc).isoformat(),
+                                "ended_at": self.params.get("p_ended_at"),
+                                "outcome": self.params.get("p_outcome"),
+                                "outcome_notes": self.params.get("p_outcome_notes") or "",
+                                "created_at": datetime.now(timezone.utc).isoformat(),
+                                "ai_summary": None,
+                            }
+                            scratch_calls.append(target_call)
 
-                        found = False
-                        for existing_sr in stage_results_table:
-                            if existing_sr.get("call_id") == call_id and existing_sr.get("stage_id") == st_id:
-                                existing_sr.update({
+                        stages = self.params.get("p_stage_results") or []
+                        for idx, sr in enumerate(stages):
+                            # Mid-transaction failure simulation: fails AFTER call insert and 1st stage
+                            if getattr(self.client, "_simulate_failure_after_first_stage", False) and idx >= 1:
+                                raise Exception("Simulated PostgreSQL transactional crash after writing 1 stage")
+
+                            st_id = sr.get("stage_id")
+                            res = sr.get("result", "completed")
+                            words = sr.get("prospect_words", "")
+                            notes = sr.get("notes", "")
+
+                            found = False
+                            for existing_sr in scratch_stages:
+                                if existing_sr.get("call_id") == call_id and existing_sr.get("stage_id") == st_id:
+                                    existing_sr.update({
+                                        "result": res,
+                                        "prospect_words": words,
+                                        "notes": notes,
+                                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                                    })
+                                    found = True
+                                    break
+                            if not found:
+                                scratch_stages.append({
+                                    "id": str(uuid4()),
+                                    "call_id": call_id,
+                                    "stage_id": st_id,
                                     "result": res,
                                     "prospect_words": words,
                                     "notes": notes,
+                                    "created_at": datetime.now(timezone.utc).isoformat(),
                                     "updated_at": datetime.now(timezone.utc).isoformat(),
                                 })
-                                found = True
-                                break
-                        if not found:
-                            stage_results_table.append({
-                                "id": str(uuid4()),
-                                "call_id": call_id,
-                                "stage_id": st_id,
-                                "result": res,
-                                "prospect_words": words,
-                                "notes": notes,
-                                "created_at": datetime.now(timezone.utc).isoformat(),
-                                "updated_at": datetime.now(timezone.utc).isoformat(),
-                            })
 
-                    saved_stages = [sr for sr in stage_results_table if sr.get("call_id") == call_id]
-                    res_obj = dict(target_call)
-                    res_obj["stage_results"] = saved_stages
-                    return Result(res_obj)
+                        # Commit scratch state to committed db_state only if transaction succeeded
+                        self.client.db_state["calls"] = scratch_calls
+                        self.client.db_state["call_stage_results"] = scratch_stages
+
+                        saved_stages = [sr for sr in scratch_stages if sr.get("call_id") == call_id]
+                        res_obj = dict(target_call)
+                        res_obj["stage_results"] = saved_stages
+                        return Result(res_obj)
 
                 raise NotImplementedError(f"RPC {self.fn} not implemented in mock")
 
@@ -1290,3 +1307,167 @@ def test_sync_offline_call_transactional_rollback(mock_db):
 
     # Verify no orphan calls left in db
     assert len(mock_db.db_state["calls"]) == initial_calls_count
+
+
+def test_sync_offline_call_mid_transaction_rollback_leaves_no_partial_records(mock_db):
+    """
+    REGRESSION TEST: Verify that if a failure occurs mid-transaction (after creating
+    the call row and writing 1 stage), PostgreSQL rolls back the entire transaction.
+    Zero call rows and zero stage rows must be committed to the database.
+    """
+    mock_db._simulate_failure_after_first_stage = True
+    payload = {
+        "client_call_id": "mid-tx-failure-uuid-555",
+        "prospect_name": "Mid-TX Crash Prospect",
+        "company_name": "Crash Tech",
+        "stage_results": [
+            {"stage_id": "opening", "result": "Reached right person"},
+            {"stage_id": "purpose", "result": "Stated purpose clearly"},
+            {"stage_id": "permission", "result": "Gave 30 seconds"},
+        ],
+    }
+
+    res = client.post("/calls/sync-offline", json=payload)
+    assert res.status_code == 500
+    assert "rolled back" in res.text
+
+    # Verify zero calls and zero stage records remain in committed database state
+    calls_in_db = [c for c in mock_db.db_state["calls"] if c.get("client_call_id") == "mid-tx-failure-uuid-555"]
+    assert len(calls_in_db) == 0, f"Expected 0 committed calls after rollback, found {len(calls_in_db)}"
+    stages_in_db = [s for s in mock_db.db_state["call_stage_results"]]
+    assert len(stages_in_db) == 0, f"Expected 0 committed stages after rollback, found {len(stages_in_db)}"
+
+
+def test_sync_offline_call_missing_rpc_returns_503_migration_guidance(mock_db):
+    """
+    REGRESSION TEST: Verify that if the sync_offline_call_transaction RPC does not
+    exist in Supabase, the API returns 503 with actionable migration instructions,
+    rather than silently falling back to a non-atomic multi-request path.
+    """
+    mock_db._simulate_missing_rpc = True
+    payload = {
+        "client_call_id": "missing-rpc-test-uuid",
+        "prospect_name": "Unmigrated DB Prospect",
+        "stage_results": [{"stage_id": "opening", "result": "Reached right person"}],
+    }
+    res = client.post("/calls/sync-offline", json=payload)
+    assert res.status_code == 503
+    assert "Database migration required" in res.text
+    assert "supabase/schema.sql" in res.text
+
+
+def test_rpc_permissions_and_empty_search_path_in_schema():
+    """
+    SECURITY TEST: Verify that the Supabase schema and standalone migration strictly:
+    1. Pin empty search_path (SET search_path = '') on sync_offline_call_transaction.
+    2. Revoke execute privileges from PUBLIC, anon, and authenticated.
+    3. Grant execute privilege SOLELY to service_role.
+    """
+    with open("supabase/schema.sql", "r") as f:
+        schema_sql = f.read()
+
+    with open("supabase/migrations/20261023_secure_sync_offline_rpc.sql", "r") as f:
+        migration_sql = f.read()
+
+    for content, filename in [(schema_sql, "schema.sql"), (migration_sql, "migration.sql")]:
+        assert "set search_path = ''" in content, f"Missing set search_path = '' in {filename}"
+        assert "revoke all on function public.sync_offline_call_transaction" in content, f"Missing revoke in {filename}"
+        assert "from public" in content, f"Missing revoke from public in {filename}"
+        assert "from anon" in content, f"Missing revoke from anon in {filename}"
+        assert "from authenticated" in content, f"Missing revoke from authenticated in {filename}"
+        assert "grant execute on function public.sync_offline_call_transaction" in content, f"Missing grant in {filename}"
+        assert "to service_role" in content, f"Missing grant to service_role in {filename}"
+
+
+def test_sync_offline_call_repeated_sync_after_lost_response(mock_db):
+    """
+    REGRESSION TEST: Verify that retrying sync after a successful server-side write
+    whose HTTP response was lost recovers the exact same call and returns 200 OK.
+    """
+    client_call_id = "lost-response-uuid-777"
+    payload = {
+        "client_call_id": client_call_id,
+        "prospect_name": "Lost Response Prospect",
+        "company_name": "Network Drop Corp",
+        "outcome": "agreed_to_receive_report",
+        "stage_results": [
+            {"stage_id": "opening", "result": "Reached right person", "notes": "Connected successfully"},
+            {"stage_id": "their_need", "result": "Stated specific priority/bottleneck", "notes": "Pain point noted"},
+        ],
+    }
+
+    # Initial sync
+    res1 = client.post("/calls/sync-offline", json=payload)
+    assert res1.status_code == 200
+    call1 = res1.json()
+
+    # Repeated sync simulation (lost response retry)
+    res2 = client.post("/calls/sync-offline", json=payload)
+    assert res2.status_code == 200
+    call2 = res2.json()
+
+    assert call1["id"] == call2["id"]
+    calls_in_db = [c for c in mock_db.db_state["calls"] if c.get("client_call_id") == client_call_id]
+    assert len(calls_in_db) == 1
+
+
+def test_concurrent_sync_same_client_call_id(mock_db):
+    """
+    CONCURRENCY TEST: Verify that concurrent requests using the same (caller_id, client_call_id)
+    recover the same call record rather than creating duplicates or surfacing avoidable conflicts.
+
+    MOCK LIMITATION DISCLOSURE:
+    This unit test exercises the FastAPI application handlers and thread-safe mock RPC logic.
+    It proves that the API layer and transaction contract handle concurrent retries cleanly.
+    It CANNOT prove live PostgreSQL engine-level concurrency (such as physical WAL writes,
+    PostgreSQL snapshot isolation locks, or live Supabase PostgREST connection pool limits).
+    Those require live cloud Supabase testing with valid credentials.
+    """
+    client_call_id = "concurrent-race-call-888"
+    payload = {
+        "client_call_id": client_call_id,
+        "prospect_name": "Concurrent Prospect",
+        "company_name": "Race Conditions Ltd",
+        "stage_results": [
+            {"stage_id": "opening", "result": "Reached right person"},
+        ],
+    }
+
+    # Execute 5 concurrent requests with identical (caller_id, client_call_id)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(client.post, "/calls/sync-offline", json=payload) for _ in range(5)]
+        results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+    # All concurrent requests should succeed (200 OK)
+    assert all(r.status_code == 200 for r in results), f"Statuses: {[r.status_code for r in results]}"
+    call_ids = [r.json()["id"] for r in results]
+    assert len(set(call_ids)) == 1, f"Expected 1 unique call ID, got: {set(call_ids)}"
+
+    # Database must contain exactly one call record
+    calls_in_db = [c for c in mock_db.db_state["calls"] if c.get("client_call_id") == client_call_id]
+    assert len(calls_in_db) == 1
+
+
+def test_sync_offline_call_derives_caller_from_authenticated_token(mock_db):
+    """
+    SECURITY TEST: Verify that the caller identity is strictly derived from the
+    authenticated token (CallerIdentity), preventing callers from forging p_caller_id.
+    """
+    client_call_id = "caller-isolation-uuid-999"
+    payload = {
+        "client_call_id": client_call_id,
+        "prospect_name": "Isolation Prospect",
+        "stage_results": [{"stage_id": "opening", "result": "Reached right person"}],
+    }
+
+    # Caller A token is set on client headers: rep-alpha
+    res = client.post("/calls/sync-offline", json=payload)
+    assert res.status_code == 200
+    call_data = res.json()
+    assert call_data["caller_id"] == "rep-alpha"
+
+    # Caller B cannot access Caller A's synced call
+    client_b = TestClient(app)
+    client_b.headers.update({"Authorization": f"Bearer {VALID_CALLER_B_TOKEN}"})
+    get_res = client_b.get(f"/calls/{call_data['id']}")
+    assert get_res.status_code == 403

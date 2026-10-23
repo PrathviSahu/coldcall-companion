@@ -210,6 +210,13 @@ on conflict (id) do update set
 -- Performs call creation, all stage result upserts, and call closure atomically
 -- inside a single PostgreSQL transaction. Retrying with the same client_call_id
 -- is idempotent and returns the existing record without creating duplicates.
+--
+-- SECURITY HARDENING:
+-- 1. Fixed empty search_path (SET search_path = '') prevents search-path hijacking.
+-- 2. Fully schema-qualified references (public.*, pg_catalog.*) protect execution integrity.
+-- 3. Default execution privileges REVOKED from PUBLIC, anon, and authenticated.
+-- 4. EXECUTE is GRANTED SOLELY to service_role (the server-side FastAPI client).
+--    Direct public REST/RPC invocation by anonymous callers is completely blocked.
 create or replace function public.sync_offline_call_transaction(
   p_caller_id text,
   p_client_call_id text,
@@ -221,16 +228,20 @@ create or replace function public.sync_offline_call_transaction(
   p_outcome text,
   p_outcome_notes text,
   p_stage_results jsonb
-) returns jsonb language plpgsql security definer as $$
+) returns jsonb
+language plpgsql
+security definer
+set search_path = ''
+as $$
 declare
-  v_call_id uuid;
+  v_call_id pg_catalog.uuid;
   v_call record;
-  v_sr jsonb;
-  v_stage_id text;
-  v_result text;
-  v_words text;
-  v_notes text;
-  v_result_json jsonb;
+  v_sr pg_catalog.jsonb;
+  v_stage_id pg_catalog.text;
+  v_result pg_catalog.text;
+  v_words pg_catalog.text;
+  v_notes pg_catalog.text;
+  v_result_json pg_catalog.jsonb;
 begin
   -- 1. Idempotency check: if client_call_id already exists for this caller, reuse it
   if p_client_call_id is not null then
@@ -248,9 +259,9 @@ begin
       end if;
       update public.calls
       set outcome = p_outcome,
-          outcome_notes = coalesce(p_outcome_notes, outcome_notes),
-          ended_at = coalesce(p_ended_at, ended_at, now()),
-          current_stage_id = coalesce(p_current_stage_id, current_stage_id)
+          outcome_notes = pg_catalog.coalesce(p_outcome_notes, outcome_notes),
+          ended_at = pg_catalog.coalesce(p_ended_at, ended_at, pg_catalog.now()),
+          current_stage_id = pg_catalog.coalesce(p_current_stage_id, current_stage_id)
       where id = v_call_id;
     end if;
   else
@@ -260,20 +271,20 @@ begin
       current_stage_id, started_at, ended_at, outcome, outcome_notes
     ) values (
       p_caller_id, p_client_call_id, p_prospect_name, p_company_name,
-      p_current_stage_id, coalesce(p_started_at, now()), p_ended_at, p_outcome, p_outcome_notes
+      p_current_stage_id, pg_catalog.coalesce(p_started_at, pg_catalog.now()), p_ended_at, p_outcome, p_outcome_notes
     ) returning id into v_call_id;
   end if;
 
   -- 3. Insert / upsert all stage results within the same transaction
-  if p_stage_results is not null and jsonb_array_length(p_stage_results) > 0 then
-    for v_sr in select * from jsonb_array_elements(p_stage_results) loop
+  if p_stage_results is not null and pg_catalog.jsonb_array_length(p_stage_results) > 0 then
+    for v_sr in select * from pg_catalog.jsonb_array_elements(p_stage_results) loop
       v_stage_id := v_sr->>'stage_id';
-      v_result := coalesce(v_sr->>'result', 'completed');
-      v_words := coalesce(v_sr->>'prospect_words', '');
-      v_notes := coalesce(v_sr->>'notes', '');
+      v_result := pg_catalog.coalesce(v_sr->>'result', 'completed');
+      v_words := pg_catalog.coalesce(v_sr->>'prospect_words', '');
+      v_notes := pg_catalog.coalesce(v_sr->>'notes', '');
 
       insert into public.call_stage_results (call_id, stage_id, result, prospect_words, notes, updated_at)
-      values (v_call_id, v_stage_id, v_result, v_words, v_notes, now())
+      values (v_call_id, v_stage_id, v_result, v_words, v_notes, pg_catalog.now())
       on conflict (call_id, stage_id) do update
       set result = excluded.result,
           prospect_words = excluded.prospect_words,
@@ -283,7 +294,7 @@ begin
   end if;
 
   -- 4. Construct and return full call object including stage_results
-  select jsonb_build_object(
+  select pg_catalog.jsonb_build_object(
     'id', c.id,
     'caller_id', c.caller_id,
     'client_call_id', c.client_call_id,
@@ -295,8 +306,8 @@ begin
     'outcome', c.outcome,
     'outcome_notes', c.outcome_notes,
     'created_at', c.created_at,
-    'stage_results', coalesce(
-      (select jsonb_agg(to_jsonb(csr)) from public.call_stage_results csr where csr.call_id = c.id),
+    'stage_results', pg_catalog.coalesce(
+      (select pg_catalog.jsonb_agg(pg_catalog.to_jsonb(csr)) from public.call_stage_results csr where csr.call_id = c.id),
       '[]'::jsonb
     )
   ) into v_result_json
@@ -305,3 +316,22 @@ begin
   return v_result_json;
 end;
 $$;
+
+-- -----------------------------------------------------------------------------
+-- Privilege Hardening: Restrict RPC execution to service_role ONLY
+-- -----------------------------------------------------------------------------
+revoke all on function public.sync_offline_call_transaction(
+  text, text, text, text, text, timestamptz, timestamptz, text, text, jsonb
+) from public;
+
+revoke all on function public.sync_offline_call_transaction(
+  text, text, text, text, text, timestamptz, timestamptz, text, text, jsonb
+) from anon;
+
+revoke all on function public.sync_offline_call_transaction(
+  text, text, text, text, text, timestamptz, timestamptz, text, text, jsonb
+) from authenticated;
+
+grant execute on function public.sync_offline_call_transaction(
+  text, text, text, text, text, timestamptz, timestamptz, text, text, jsonb
+) to service_role;

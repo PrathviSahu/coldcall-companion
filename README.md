@@ -64,7 +64,9 @@ Derived directly from the DeepThought cold-call structure guidelines and empiric
      - **Save as Offline Draft**: Preserves the complete draft locally with an `UNSYNCED DRAFT` tag so callers can wrap up without data loss.
 9. **Atomic & Idempotent Offline Sync (`POST /calls/sync-offline`)**:
    - **Stable Client UUIDs & Unique Constraints**: Every locally created call receives a stable UUID v4 (`client_call_id`). In `supabase/schema.sql`, a unique index `calls_client_call_id_idx` on `(caller_id, client_call_id)` prevents duplicate records across network retries.
-   - **PostgreSQL Transactional RPC**: `sync_offline_call_transaction` executes call creation, stage result writes, and final outcome inside a single PostgreSQL database transaction. If any write fails, the entire transaction rolls back. A client-coordinated rollback fallback is also enforced in the Python backend.
+   - **Sole Atomic Path (PostgreSQL Transactional RPC)**: `public.sync_offline_call_transaction` executes call creation, stage result writes, and final outcome inside a single PostgreSQL database transaction. If any write fails, PostgreSQL automatically rolls back the entire transaction.
+   - **RPC Security & Isolation**: The function pins `SET search_path = ''` with fully schema-qualified relation references (`public.*`, `pg_catalog.*`), revokes execution privileges from `PUBLIC`, `anon`, and `authenticated`, and grants execute solely to `service_role`. The backend derives `p_caller_id` from the authenticated caller token.
+   - **Migration Guidance (No Silent Non-Atomic Fallback)**: Misleading non-atomic multi-request REST fallbacks have been removed. If the RPC function is not yet installed in Supabase, the backend returns `503 Service Unavailable` with instructions to apply `supabase/migrations/20261023_secure_sync_offline_rpc.sql` or `supabase/schema.sql`.
    - **Strict Pre-Validation (No Silent Ingestion)**: Before writing any data to the database, the endpoint validates that every stage ID in `stage_results` is recognized. Unrecognized stage IDs, duplicate stage entries, invalid outcomes, or inverted timestamps immediately reject the request with `422 Unprocessable Entity`—zero orphan or partial records are written.
 10. **Ambiguous Network Close Recovery & Idempotency**:
    - If a call is closed on the server but the HTTP response is dropped or timed out, retrying `POST /calls/{id}/close` with the matching outcome returns `200 OK` with the finalized call data rather than throwing an error.
@@ -83,6 +85,8 @@ Derived directly from the DeepThought cold-call structure guidelines and empiric
    - `public.calls` (with outcome constraints, stage tracking, and AI debrief column)
    - `public.call_stage_results` (with composite unique key on `call_id, stage_id`)
    - Indexes and Row Level Security policies.
+   - `sync_offline_call_transaction` secured PostgreSQL RPC (restricted to `service_role`).
+4. **Existing Databases**: Run `supabase/migrations/20261023_secure_sync_offline_rpc.sql` in the Supabase SQL Editor to apply the `client_call_id` column, unique index, empty `search_path`, and `service_role` execute grants.
    The script is fully idempotent (`ON CONFLICT (id) DO UPDATE`).
 
 4. **Selective Legacy Record Audit & Reassignment**:

@@ -584,7 +584,7 @@ def sync_offline_call(
                     detail=f"Call is already closed with conflicting outcome '{existing.get('outcome')}'"
                 )
 
-    # 6. Attempt PostgreSQL Transactional RPC (Single atomic transaction in database)
+    # 6. Execute PostgreSQL Transactional RPC (Sole atomic persistence path)
     stages_json = [sr.model_dump() for sr in payload.stage_results]
     try:
         rpc_call = d.rpc("sync_offline_call_transaction", {
@@ -601,89 +601,19 @@ def sync_offline_call(
         }).execute()
         if rpc_call and rpc_call.data:
             return rpc_call.data
+        raise HTTPException(500, "Database transaction returned empty payload")
     except HTTPException:
         raise
     except Exception as e:
         err_msg = str(e)
-        if "already finalized" in err_msg or "23505" in err_msg:
+        if "already finalized" in err_msg or "23505" in err_msg or "Conflict" in err_msg:
             raise HTTPException(status_code=409, detail=err_msg)
-        if "Simulated PostgreSQL transactional failure" in err_msg:
-            raise HTTPException(500, f"Transaction rolled back: {err_msg}")
-        logger.warning(f"RPC call failed or unavailable ({e}); initiating client-coordinated rollback transaction.")
-
-    # 7. Fallback Transaction Block with Rollback on Failure
-    call_id = None
-    is_new = False
-    try:
-        if payload.client_call_id:
-            existing = (
-                d.table("calls")
-                .select("*")
-                .eq("caller_id", caller.id)
-                .eq("client_call_id", payload.client_call_id)
-                .maybe_single()
-                .execute()
-                .data
+        if "function" in err_msg.lower() and ("does not exist" in err_msg.lower() or "not found" in err_msg.lower()):
+            raise HTTPException(
+                status_code=503,
+                detail="Database migration required: sync_offline_call_transaction RPC function does not exist in Supabase. Run supabase/schema.sql (or supabase/migrations/20261023_secure_sync_offline_rpc.sql) in Supabase SQL Editor to enable atomic offline sync."
             )
-            if existing:
-                call_id = existing["id"]
-
-        if not call_id:
-            is_new = True
-            call_row: dict[str, Any] = {
-                "caller_id": caller.id,
-                "client_call_id": payload.client_call_id,
-                "prospect_name": payload.prospect_name,
-                "company_name": payload.company_name,
-                "current_stage_id": current_stage,
-                "started_at": started_at_str,
-            }
-            if payload.outcome:
-                call_row["outcome"] = payload.outcome
-                call_row["outcome_notes"] = payload.outcome_notes
-                call_row["ended_at"] = ended_at_str or datetime.now(timezone.utc).isoformat()
-
-            res = d.table("calls").insert(call_row).execute()
-            if not res.data:
-                raise HTTPException(500, "Could not create call record")
-            call_id = res.data[0]["id"]
-        else:
-            if payload.outcome:
-                d.table("calls").update({
-                    "outcome": payload.outcome,
-                    "outcome_notes": payload.outcome_notes,
-                    "ended_at": ended_at_str or datetime.now(timezone.utc).isoformat(),
-                    "current_stage_id": current_stage,
-                }).eq("id", str(call_id)).execute()
-
-        # Write stage results
-        saved_stages = []
-        for sr in payload.stage_results:
-            stage_row = {
-                "call_id": str(call_id),
-                "stage_id": sr.stage_id,
-                "result": sr.result,
-                "prospect_words": sr.prospect_words,
-                "notes": sr.notes,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-            sres = d.table("call_stage_results").upsert(stage_row, on_conflict="call_id,stage_id").execute()
-            if not sres.data:
-                raise RuntimeError(f"Failed to write stage {sr.stage_id}")
-            saved_stages.append(sres.data[0])
-
-        full_call = d.table("calls").select("*").eq("id", str(call_id)).maybe_single().execute().data
-        full_call["stage_results"] = saved_stages
-        return full_call
-
-    except Exception as exc:
-        # Rollback: if newly created call, clean up to prevent half-synced or orphan record
-        if is_new and call_id:
-            try:
-                d.table("calls").delete().eq("id", str(call_id)).execute()
-            except Exception:
-                pass
-        raise HTTPException(500, f"Transaction rolled back: {exc}")
+        raise HTTPException(status_code=500, detail=f"Database transaction rolled back: {err_msg}")
 
 
 
