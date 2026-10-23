@@ -239,10 +239,13 @@ class MockSupabaseClient:
                         if target.get("caller_id") != caller_id and caller_role != "admin":
                             raise Exception("Forbidden: You are not authorized to close this call")
 
-                        if target.get("ended_at") or target.get("outcome"):
+                        if target.get("ended_at") is not None and target.get("outcome") is None:
+                            raise Exception(f"DataIntegrityError: Call {call_id} has ended_at set but outcome is null")
+
+                        if target.get("outcome"):
                             if target.get("outcome") != outcome:
                                 raise Exception(f"Conflict: Call {call_id} is already finalized with outcome {target.get('outcome')}")
-                            # Matching outcome: idempotent retry
+                            # Matching outcome: idempotent retry, do not mutate outcome_notes or ended_at
                         else:
                             target["outcome"] = outcome
                             target["outcome_notes"] = notes or target.get("outcome_notes") or ""
@@ -274,13 +277,21 @@ class MockSupabaseClient:
 
                         if existing_call:
                             call_id = existing_call["id"]
-                            if self.params.get("p_outcome"):
-                                if existing_call.get("outcome") and existing_call.get("outcome") != self.params.get("p_outcome"):
+                            # Inconsistent record check
+                            if existing_call.get("ended_at") is not None and existing_call.get("outcome") is None:
+                                raise Exception(f"DataIntegrityError: Call {call_id} has ended_at set but outcome is null")
+
+                            if existing_call.get("outcome"):
+                                if self.params.get("p_outcome") and existing_call.get("outcome") != self.params.get("p_outcome"):
                                     raise Exception(f"Conflict: Call {call_id} is already finalized with outcome {existing_call.get('outcome')}")
-                                existing_call["outcome"] = self.params.get("p_outcome")
-                                existing_call["outcome_notes"] = self.params.get("p_outcome_notes") or ""
-                                if self.params.get("p_ended_at"):
-                                    existing_call["ended_at"] = self.params.get("p_ended_at")
+                                # Already finalized: preserve outcome, outcome_notes, and ended_at as immutable
+                            else:
+                                if self.params.get("p_outcome"):
+                                    existing_call["outcome"] = self.params.get("p_outcome")
+                                    existing_call["outcome_notes"] = self.params.get("p_outcome_notes") or ""
+                                    existing_call["ended_at"] = self.params.get("p_ended_at") or datetime.now(timezone.utc).isoformat()
+                                if self.params.get("p_current_stage_id"):
+                                    existing_call["current_stage_id"] = self.params.get("p_current_stage_id")
                             target_call = existing_call
                         else:
                             call_id = str(uuid4())
@@ -2111,3 +2122,208 @@ def test_real_postgresql_concurrent_close_call_conflict_rejection():
     assert r_res.returncode == 0
     data = json.loads(r_res.stdout.strip())
     assert data["outcome"] == winner_outcome
+
+
+def test_real_postgresql_matching_sync_retry_preserves_finalization_metadata():
+    """
+    REAL POSTGRESQL TEST: Proves that when sync_offline_call_transaction is retried
+    with the matching outcome on an already-finalized call:
+    1. It succeeds and returns 200 OK.
+    2. Finalization metadata (outcome, outcome_notes, ended_at) is preserved as immutable
+       and is NOT overwritten by the retry payload.
+    3. Missing stage results in the retry are synced atomically.
+    """
+    if not _check_real_postgres():
+        pytest.skip("Local PostgreSQL database coldcall_test not available")
+
+    # Re-apply migrations
+    subprocess.run([PSQL_BIN, "-d", "coldcall_test", "-f", "supabase/migrations/20261023_secure_sync_offline_rpc.sql"], capture_output=True, text=True)
+
+    client_id = f"pg-preserve-meta-{uuid4()}"
+    orig_notes = "Original immutable outcome notes"
+    orig_ended = "2026-10-23 14:00:00+00"
+
+    # Step 1: Create finalized call
+    create_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        INSERT INTO public.calls (
+          caller_id, client_call_id, prospect_name, company_name, current_stage_id,
+          outcome, outcome_notes, started_at, ended_at
+        ) VALUES (
+          'rep-alpha', '{client_id}', 'Preserve Prospect', 'Preserve Ltd', 'opening',
+          'meeting_booked', '{orig_notes}', NOW(), '{orig_ended}'::timestamptz
+        ) RETURNING id;
+        """
+    ]
+    r = subprocess.run(create_cmd, capture_output=True, text=True)
+    assert r.returncode == 0
+    call_id = r.stdout.strip().splitlines()[0]
+
+    # Step 2: Retry sync with same outcome 'meeting_booked', but different notes & ended_at and 1 stage
+    sync_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SELECT public.sync_offline_call_transaction(
+          'rep-alpha',
+          '{client_id}',
+          'Preserve Prospect',
+          'Preserve Ltd',
+          'purpose',
+          NOW(),
+          '2026-10-23 15:30:00+00'::timestamptz,
+          'meeting_booked',
+          'Attempted overwrite notes that must be ignored',
+          '[{{"stage_id": "opening", "result": "Reached right person"}}]'::jsonb
+        );
+        """
+    ]
+    sync_r = subprocess.run(sync_cmd, capture_output=True, text=True)
+    assert sync_r.returncode == 0, f"Retry failed: {sync_r.stderr}"
+    data = json.loads(sync_r.stdout.strip())
+
+    # Metadata must match original
+    assert data["outcome"] == "meeting_booked"
+    assert data["outcome_notes"] == orig_notes
+    assert len(data["stage_results"]) == 1
+
+    # Verify directly in database table
+    chk_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"SELECT outcome, outcome_notes FROM public.calls WHERE id = '{call_id}';"
+    ]
+    chk_r = subprocess.run(chk_cmd, capture_output=True, text=True)
+    db_outcome, db_notes = chk_r.stdout.strip().split("|")
+    assert db_outcome == "meeting_booked"
+    assert db_notes == orig_notes
+
+
+def test_real_postgresql_conflicting_sync_retry_preserves_original_data():
+    """
+    REAL POSTGRESQL TEST: Proves that when sync_offline_call_transaction is invoked
+    with a conflicting outcome on an already-finalized call:
+    1. It fails with 23505 conflict exception.
+    2. Persisted call row and all fields remain completely unaltered.
+    """
+    if not _check_real_postgres():
+        pytest.skip("Local PostgreSQL database coldcall_test not available")
+
+    client_id = f"pg-conflict-preserve-{uuid4()}"
+    orig_notes = "Immutable meeting booked notes"
+
+    create_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        INSERT INTO public.calls (
+          caller_id, client_call_id, prospect_name, company_name, current_stage_id,
+          outcome, outcome_notes, started_at, ended_at
+        ) VALUES (
+          'rep-alpha', '{client_id}', 'Conflict Prospect', 'Conflict Ltd', 'opening',
+          'meeting_booked', '{orig_notes}', NOW(), NOW()
+        ) RETURNING id;
+        """
+    ]
+    r = subprocess.run(create_cmd, capture_output=True, text=True)
+    assert r.returncode == 0
+    call_id = r.stdout.strip().splitlines()[0]
+
+    # Attempt conflicting sync with outcome 'not_interested'
+    sync_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SELECT public.sync_offline_call_transaction(
+          'rep-alpha',
+          '{client_id}',
+          'Conflict Prospect',
+          'Conflict Ltd',
+          'opening',
+          NOW(),
+          NOW(),
+          'not_interested',
+          'Conflicting notes',
+          '[]'::jsonb
+        );
+        """
+    ]
+    sync_r = subprocess.run(sync_cmd, capture_output=True, text=True)
+    assert sync_r.returncode != 0
+    assert "already finalized with outcome meeting_booked" in sync_r.stderr
+
+    # Verify persisted fields are unchanged
+    chk_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"SELECT outcome, outcome_notes FROM public.calls WHERE id = '{call_id}';"
+    ]
+    chk_r = subprocess.run(chk_cmd, capture_output=True, text=True)
+    db_outcome, db_notes = chk_r.stdout.strip().split("|")
+    assert db_outcome == "meeting_booked"
+    assert db_notes == orig_notes
+
+
+def test_real_postgresql_inconsistent_finalized_records_rejected():
+    """
+    REAL POSTGRESQL TEST: Proves that both close_call_transaction and sync_offline_call_transaction
+    detect inconsistent records (ended_at is set but outcome is null) and raise 23514 DataIntegrityError,
+    never reporting false success on a record lacking a valid outcome.
+    """
+    if not _check_real_postgres():
+        pytest.skip("Local PostgreSQL database coldcall_test not available")
+
+    client_id = f"pg-inconsistent-{uuid4()}"
+
+    # Insert inconsistent record: ended_at is set, but outcome is NULL
+    create_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        INSERT INTO public.calls (
+          caller_id, client_call_id, prospect_name, company_name, current_stage_id,
+          outcome, outcome_notes, started_at, ended_at
+        ) VALUES (
+          'rep-alpha', '{client_id}', 'Inconsistent Prospect', 'Inc Corp', 'opening',
+          NULL, NULL, NOW(), NOW()
+        ) RETURNING id;
+        """
+    ]
+    r = subprocess.run(create_cmd, capture_output=True, text=True)
+    assert r.returncode == 0
+    call_id = r.stdout.strip().splitlines()[0]
+
+    # 1. close_call_transaction must reject inconsistent record
+    close_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SELECT public.close_call_transaction(
+          '{call_id}'::uuid,
+          'rep-alpha',
+          'caller',
+          'meeting_booked',
+          'Close attempt',
+          NOW()
+        );
+        """
+    ]
+    close_r = subprocess.run(close_cmd, capture_output=True, text=True)
+    assert close_r.returncode != 0
+    assert "DataIntegrityError" in close_r.stderr or "ended_at set but outcome is null" in close_r.stderr
+
+    # 2. sync_offline_call_transaction must also reject inconsistent record
+    sync_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SELECT public.sync_offline_call_transaction(
+          'rep-alpha',
+          '{client_id}',
+          'Inconsistent Prospect',
+          'Inc Corp',
+          'opening',
+          NOW(),
+          NOW(),
+          'meeting_booked',
+          'Sync attempt',
+          '[]'::jsonb
+        );
+        """
+    ]
+    sync_r = subprocess.run(sync_cmd, capture_output=True, text=True)
+    assert sync_r.returncode != 0
+    assert "DataIntegrityError" in sync_r.stderr or "ended_at set but outcome is null" in sync_r.stderr

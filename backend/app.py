@@ -524,6 +524,11 @@ def close_call(
             raise HTTPException(404, "Call not found")
         if "Forbidden" in err_msg or "42501" in err_msg:
             raise HTTPException(403, "Forbidden: You are not authorized to close this call")
+        if "DataIntegrityError" in err_msg or "23514" in err_msg:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Inconsistent call state: call has ended_at set but outcome is null ({err_msg})"
+            )
         if "already finalized" in err_msg or "Conflict" in err_msg or "23505" in err_msg:
             raise HTTPException(
                 status_code=409,
@@ -539,6 +544,11 @@ def close_call(
         raise HTTPException(404, "Call not found")
     if call.get("caller_id") != caller.id and caller.role != "admin":
         raise HTTPException(403, "Forbidden: You are not authorized to close this call")
+    if call.get("ended_at") is not None and call.get("outcome") is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Inconsistent call state: call {call_id} has ended_at set but outcome is null"
+        )
     if call.get("ended_at") is not None or call.get("outcome") is not None:
         if call.get("outcome") == payload.outcome:
             full = d.table("calls").select("*").eq("id", str(call_id)).maybe_single().execute().data
@@ -653,6 +663,11 @@ def sync_offline_call(
         raise
     except Exception as e:
         err_msg = str(e)
+        if "DataIntegrityError" in err_msg or "23514" in err_msg:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Inconsistent call state: call has ended_at set but outcome is null ({err_msg})"
+            )
         if "already finalized" in err_msg or "23505" in err_msg or "Conflict" in err_msg:
             raise HTTPException(status_code=409, detail=err_msg)
         if "function" in err_msg.lower() and ("does not exist" in err_msg.lower() or "not found" in err_msg.lower()):

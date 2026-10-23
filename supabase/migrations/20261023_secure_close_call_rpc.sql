@@ -38,13 +38,19 @@ begin
       using errcode = '42501';
   end if;
 
-  -- 3. Finalization integrity check
-  if v_call.ended_at is not null or v_call.outcome is not null then
-    if v_call.outcome is not null and v_call.outcome <> p_outcome then
+  -- 3. Detect inconsistent records (ended_at set but outcome is null)
+  if v_call.ended_at is not null and v_call.outcome is null then
+    raise exception 'DataIntegrityError: Call % has ended_at set but outcome is null', p_call_id
+      using errcode = '23514';
+  end if;
+
+  -- 4. Finalization integrity check
+  if v_call.outcome is not null then
+    if v_call.outcome <> p_outcome then
       raise exception 'Conflict: Call % is already finalized with outcome %', p_call_id, v_call.outcome
         using errcode = '23505';
     end if;
-    -- Matching outcome: idempotent retry, do not mutate persisted outcome/notes/ended_at
+    -- Already finalized with matching outcome: idempotent retry, do not mutate persisted outcome/notes/ended_at
   else
     -- Call is open: finalize atomically
     update public.calls
