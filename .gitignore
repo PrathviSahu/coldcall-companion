@@ -10,3 +10,4 @@ dist/
 *.zip
 scratch/
 raw_transcripts/
+supabase/.temp/

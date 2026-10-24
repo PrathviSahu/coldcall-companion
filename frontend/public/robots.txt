@@ -1,0 +1,7 @@
+# robots.txt for ColdCall Companion (Sidecall)
+User-agent: *
+Allow: /
+Disallow: /api/
+
+# Replace with your production domain after deployment
+Sitemap: https://coldcall-companion.vercel.app/sitemap.xml

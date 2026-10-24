@@ -211,6 +211,11 @@ on conflict (id) do update set
 -- inside a single PostgreSQL transaction. Retrying with the same client_call_id
 -- is idempotent and returns the existing record without creating duplicates.
 --
+-- OUTCOME & NULL SEMANTICS:
+-- Offline sync can represent an open call in progress; p_outcome may legitimately
+-- be NULL if and only if p_ended_at is also NULL. If p_ended_at is provided,
+-- p_outcome must be one of the 11 canonical outcomes and cannot be NULL or blank.
+--
 -- SECURITY HARDENING:
 -- 1. Fixed empty search_path (SET search_path = '') prevents search-path hijacking.
 -- 2. Fully schema-qualified references (public.*, pg_catalog.*) protect execution integrity.
@@ -259,7 +264,11 @@ begin
       raise exception 'DataIntegrityError: Outcome cannot be blank or whitespace-only'
         using errcode = '23514';
     end if;
-    v_clean_outcome := trim(p_outcome);
+    if trim(p_outcome) <> p_outcome then
+      raise exception 'DataIntegrityError: Outcome cannot contain leading or trailing whitespace: %', p_outcome
+        using errcode = '23514';
+    end if;
+    v_clean_outcome := p_outcome;
     if v_clean_outcome not in (
       'meeting_booked',
       'next_step_agreed',
@@ -460,6 +469,11 @@ grant execute on function public.sync_offline_call_transaction(
 -- Locks the call record with FOR UPDATE to prevent race conditions between
 -- concurrent close requests. Enforces outcome validation, authorization, and
 -- idempotent matching retries atomically in PostgreSQL.
+--
+-- OUTCOME & NULL SEMANTICS:
+-- Unlike offline sync which may sync an in-progress open call with NULL outcome,
+-- close_call_transaction is strictly a finalization operation. It strictly
+-- rejects NULL, blank, whitespace-padded, or unsupported outcomes before updating.
 create or replace function public.close_call_transaction(
   p_call_id uuid,
   p_caller_id text,
@@ -476,7 +490,47 @@ declare
   v_call record;
   v_res jsonb;
 begin
-  -- 1. Acquire row lock on call record
+  -- 1. Validate caller identity: reject null, blank, or whitespace-only
+  if p_caller_id is null or trim(p_caller_id) = '' then
+    raise exception 'Unauthorized: Caller ID cannot be null or blank'
+      using errcode = '42501';
+  end if;
+
+  -- 2. Validate caller role: reject null or unsupported roles
+  if p_caller_role is null or p_caller_role not in ('caller', 'admin') then
+    raise exception 'Unauthorized: Invalid caller role %', coalesce(p_caller_role, '<null>')
+      using errcode = '42501';
+  end if;
+
+  -- 3. Validate outcome: reject null, blank, whitespace-only, whitespace-padded, and unsupported outcomes
+  if p_outcome is null or trim(p_outcome) = '' then
+    raise exception 'DataIntegrityError: Outcome cannot be null or blank'
+      using errcode = '23514';
+  end if;
+
+  if trim(p_outcome) <> p_outcome then
+    raise exception 'DataIntegrityError: Outcome cannot contain leading or trailing whitespace: %', p_outcome
+      using errcode = '23514';
+  end if;
+
+  if p_outcome not in (
+    'meeting_booked',
+    'next_step_agreed',
+    'agreed_to_receive_report',
+    'follow_up',
+    'interested',
+    'not_interested',
+    'do_not_call',
+    'wrong_person',
+    'moved_company',
+    'no_answer',
+    'other'
+  ) then
+    raise exception 'DataIntegrityError: Invalid outcome %', p_outcome
+      using errcode = '23514';
+  end if;
+
+  -- 4. Acquire row lock on call record
   select * into v_call from public.calls
   where id = p_call_id
   for update;
@@ -486,19 +540,19 @@ begin
       using errcode = 'P0002';
   end if;
 
-  -- 2. Authorization check
-  if v_call.caller_id <> p_caller_id and p_caller_role <> 'admin' then
+  -- 5. Authorization check with IS DISTINCT FROM (preserving admin exception)
+  if (v_call.caller_id is distinct from p_caller_id) and (p_caller_role is distinct from 'admin') then
     raise exception 'Forbidden: You are not authorized to close this call'
       using errcode = '42501';
   end if;
 
-  -- 3. Detect inconsistent records (ended_at set but outcome is null)
+  -- 6. Detect inconsistent records (ended_at set but outcome is null)
   if v_call.ended_at is not null and v_call.outcome is null then
     raise exception 'DataIntegrityError: Call % has ended_at set but outcome is null', p_call_id
       using errcode = '23514';
   end if;
 
-  -- 4. Finalization integrity check
+  -- 7. Finalization integrity check
   if v_call.outcome is not null then
     if v_call.outcome <> p_outcome then
       raise exception 'Conflict: Call % is already finalized with outcome %', p_call_id, v_call.outcome
@@ -514,7 +568,7 @@ begin
     where id = p_call_id;
   end if;
 
-  -- 4. Construct and return full call object including stage_results
+  -- 8. Construct and return full call object including stage_results
   select pg_catalog.jsonb_build_object(
     'id', c.id,
     'caller_id', c.caller_id,

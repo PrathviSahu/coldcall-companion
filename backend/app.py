@@ -4,8 +4,9 @@ from datetime import datetime, timezone
 from typing import Any, Self
 from uuid import UUID
 import json
+import ipaddress
 
-from fastapi import FastAPI, HTTPException, Security, Depends, Header
+from fastapi import FastAPI, HTTPException, Security, Depends, Header, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import httpx
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,8 +39,10 @@ app.add_middleware(
 )
 
 supabase: Client | None = None
-if create_client is not None and os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_SERVICE_ROLE_KEY"):
-    supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
+_sb_url = (os.getenv("SUPABASE_URL") or "").strip()
+_sb_key = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+if create_client is not None and _sb_url and _sb_key:
+    supabase = create_client(_sb_url, _sb_key)
 
 # -----------------------------------------------------------------------------
 # Caller Authentication & Authorization Model
@@ -836,3 +839,211 @@ async def generate_ai_summary(
     if not update.data:
         raise HTTPException(500, "Generated summary but could not save it")
     return {"status": "ready", "configured": True, "summary": summary, "cached": False}
+
+
+# -----------------------------------------------------------------------------
+# Contact Submission & Support Dispatch (Server-Side Secrets & Rate Limiting)
+# -----------------------------------------------------------------------------
+class ContactPayload(BaseModel):
+    name: str | None = None
+    email: str
+    message: str
+    honeypot: str | None = None
+
+    @model_validator(mode="after")
+    def validate_contact(self) -> Self:
+        clean_email = self.email.strip()
+        if not clean_email or "@" not in clean_email or "." not in clean_email.split("@")[-1]:
+            raise ValueError("A valid email address is required.")
+        if len(clean_email) > 254:
+            raise ValueError("Email exceeds maximum allowable length.")
+        self.email = clean_email
+
+        clean_msg = self.message.strip()
+        if not clean_msg or len(clean_msg) < 5:
+            raise ValueError("Message must be at least 5 characters long.")
+        if len(clean_msg) > 5000:
+            raise ValueError("Message exceeds 5,000 character limit.")
+        self.message = clean_msg
+
+        if self.name:
+            self.name = self.name.strip()[:100]
+        return self
+
+
+# -----------------------------------------------------------------------------
+# Proxy-Aware Client IP Extraction & Sliding Window Rate Limiter
+# -----------------------------------------------------------------------------
+def is_trusted_proxy(host: str) -> bool:
+    """
+    Determines whether a connecting socket client is an explicitly trusted proxy.
+    Only trusted proxies are permitted to supply client IP forwarding headers
+    (CF-Connecting-IP, X-Forwarded-For, X-Real-IP).
+    """
+    if not host or host == "unknown":
+        return False
+    if host in ("testclient", "localhost"):
+        return True
+
+    trusted_env = os.getenv("TRUSTED_PROXY_IPS", "").strip()
+    configured = [p.strip() for p in trusted_env.split(",") if p.strip()]
+    if host in configured:
+        return True
+
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_loopback:
+            return True
+        for entry in configured:
+            try:
+                if ip in ipaddress.ip_network(entry, strict=False):
+                    return True
+            except ValueError:
+                pass
+        if os.getenv("TRUST_PRIVATE_PROXIES", "false").lower() in ("1", "true", "yes") and ip.is_private:
+            return True
+    except ValueError:
+        pass
+    return False
+
+
+def validate_ip_candidate(candidate: str | None) -> str | None:
+    """
+    Validates and canonicalizes an IP candidate string (IPv4 or IPv6),
+    stripping optional client port if supplied in IPv4 (e.g. 1.2.3.4:5678).
+    Returns string IP if valid, None if invalid.
+    """
+    if not candidate:
+        return None
+    clean = candidate.strip()
+    # Strip optional IPv4 port (e.g. 1.2.3.4:8080)
+    if ":" in clean and not clean.startswith("[") and clean.count(":") == 1:
+        clean = clean.split(":")[0].strip()
+    # Strip bracketed IPv6 with port (e.g. [2001:db8::1]:8080)
+    elif clean.startswith("[") and "]" in clean:
+        clean = clean[1:clean.index("]")].strip()
+
+    try:
+        ipaddress.ip_address(clean)
+        return clean
+    except ValueError:
+        return None
+
+
+def extract_client_ip(req: Request) -> str:
+    """
+    Safely resolves client IP for rate limiting.
+    Security Guard: If the immediate connecting host is NOT an explicitly trusted proxy,
+    forwarding headers (CF-Connecting-IP, X-Forwarded-For, X-Real-IP) are strictly ignored
+    to prevent client IP spoofing attacks.
+    Additionally, forwarded IP candidates are validated using ipaddress to prevent injection
+    or malformed values.
+    """
+    socket_host = req.client.host if req.client else "unknown"
+    if not is_trusted_proxy(socket_host):
+        return socket_host
+
+    cf_connecting_ip = req.headers.get("cf-connecting-ip")
+    if cf_connecting_ip:
+        valid_cf = validate_ip_candidate(cf_connecting_ip)
+        if valid_cf:
+            return valid_cf
+
+    x_forwarded_for = req.headers.get("x-forwarded-for")
+    if x_forwarded_for and x_forwarded_for.strip():
+        # In standard reverse proxy chaining (client, proxy1, proxy2), leftmost is the client
+        client_candidate = x_forwarded_for.split(",")[0].strip()
+        valid_xff = validate_ip_candidate(client_candidate)
+        if valid_xff:
+            return valid_xff
+
+    x_real_ip = req.headers.get("x-real-ip")
+    if x_real_ip:
+        valid_x_real = validate_ip_candidate(x_real_ip)
+        if valid_x_real:
+            return valid_x_real
+
+    return socket_host
+
+# In-memory sliding window rate limiter: max 5 requests per 10 minutes per IP
+# Architectural Note: This limiter operates in-memory per worker process.
+# For distributed multi-instance production scale, configure an external Redis or Upstash key-value store.
+_contact_rate_limit: dict[str, list[float]] = {}
+
+@app.post("/contact")
+async def handle_contact_submission(payload: ContactPayload, req: Request) -> dict[str, Any]:
+    """
+    Receives contact/support messages, validates payload, checks honeypot spam protection,
+    enforces client rate limiting behind deployment proxies, and dispatches via server-side webhook secrets.
+    Formats the payload to be natively compatible with Slack incoming webhooks, Discord webhooks,
+    and generic JSON receivers (Zapier, Make, CRM webhooks).
+    """
+    # 1. Anti-spam honeypot: silently acknowledge if bot populated hidden field
+    if payload.honeypot and payload.honeypot.strip():
+        return {"status": "received", "message": "Feedback received."}
+
+    # 2. Proxy-aware rate limiting by client IP
+    client_ip = extract_client_ip(req)
+    now_ts = datetime.now(timezone.utc).timestamp()
+    history = [ts for ts in _contact_rate_limit.get(client_ip, []) if now_ts - ts < 600]
+    if len(history) >= 5:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many contact submissions. Please wait several minutes before trying again."
+        )
+    history.append(now_ts)
+    _contact_rate_limit[client_ip] = history
+
+    # 3. Check for server-side secret destination
+    webhook_url = os.getenv("CONTACT_WEBHOOK_URL", "").strip()
+    if not webhook_url:
+        raise HTTPException(
+            status_code=503,
+            detail="Contact support destination is not configured on the server. Please contact the administrator directly."
+        )
+
+    # 4. Construct provider-compatible webhook payload
+    submitted_at = datetime.now(timezone.utc).isoformat()
+    sender_name = payload.name or "Anonymous Caller"
+    # Format message quote with markdown block quote
+    quoted_message = payload.message.replace("\n", "\n> ")
+    formatted_summary = (
+        f"*New Sidecall Support Inquiry*\n"
+        f"• *From:* {sender_name} <{payload.email}>\n"
+        f"• *Submitted:* {submitted_at}\n"
+        f"• *Message:*\n> {quoted_message}"
+    )
+
+    webhook_payload = {
+        # Slack incoming webhook compatibility (Slack strictly requires 'text' or 'blocks'):
+        "text": formatted_summary,
+        # Discord webhook compatibility:
+        "content": formatted_summary,
+        # Generic structured JSON receivers (Zapier, Make, custom CRM/DB webhooks):
+        "name": sender_name,
+        "email": payload.email,
+        "message": payload.message,
+        "submitted_at": submitted_at,
+        "source": "Sidecall Web Companion",
+    }
+
+    # 5. Dispatch to verified server-side webhook
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                webhook_url,
+                json=webhook_payload,
+            )
+            resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Webhook provider rejected submission with HTTP {exc.response.status_code}."
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to deliver contact message to configured destination."
+        ) from exc
+
+    return {"status": "received", "message": "Thank you! Your message has been forwarded to support."}

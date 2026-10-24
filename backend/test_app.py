@@ -1434,7 +1434,10 @@ def test_rpc_permissions_and_empty_search_path_in_schema():
     with open("supabase/migrations/20261023_secure_sync_offline_rpc.sql", "r") as f:
         migration_sql = f.read()
 
-    for content, filename in [(schema_sql, "schema.sql"), (migration_sql, "migration.sql")]:
+    with open("supabase/migrations/20261024000000_reconcile_offline_sync_and_close_rpcs.sql", "r") as f:
+        reconcile_sql = f.read()
+
+    for content, filename in [(schema_sql, "schema.sql"), (migration_sql, "migration.sql"), (reconcile_sql, "reconcile_migration.sql")]:
         assert "pg_catalog.coalesce" not in content, f"Invalid pg_catalog.coalesce syntax in {filename}"
         assert "pg_catalog.trim" not in content, f"Invalid pg_catalog.trim syntax in {filename}"
         assert "set search_path = ''" in content, f"Missing set search_path = '' in {filename}"
@@ -2068,7 +2071,7 @@ def test_real_postgresql_concurrent_close_call_conflict_rejection():
         pytest.skip("Local PostgreSQL database coldcall_test not available")
 
     # Re-apply migrations
-    subprocess.run([PSQL_BIN, "-d", "coldcall_test", "-f", "supabase/migrations/20261023_secure_close_call_rpc.sql"], capture_output=True, text=True)
+    subprocess.run([PSQL_BIN, "-d", "coldcall_test", "-f", "supabase/migrations/20261023232952_secure_close_call_rpc.sql"], capture_output=True, text=True)
 
     # 1. Create open call with unique key
     test_close_key = f"pg-close-race-{uuid4()}"
@@ -2899,3 +2902,829 @@ def test_real_postgresql_offline_sync_insertion_paths_and_outcomes():
         capture_output=True, text=True
     )
     assert chk_u4.stdout.strip() == "t|t"
+
+
+def test_real_postgresql_first_atomic_close_of_open_call():
+    """
+    REAL POSTGRESQL TEST: Validates the first atomic close of an open call:
+    1. Creates an open call with outcome IS NULL and ended_at IS NULL.
+    2. Calls close_call_transaction with a valid outcome and caller identity.
+    3. Verifies the stored outcome and ended_at are populated.
+    4. Retries with the same outcome and verifies idempotent behavior (original metadata preserved).
+    5. Retries with a conflicting outcome and verifies 23505 conflict rejection.
+    6. Confirms caller isolation prevents unauthorized callers from closing the call.
+    """
+    if not _check_real_postgres():
+        pytest.skip("Local PostgreSQL database coldcall_test not available")
+
+    # Ensure reconciliation migration is applied
+    apply_res = subprocess.run([PSQL_BIN, "-v", "ON_ERROR_STOP=1", "-d", "coldcall_test", "-f", "supabase/migrations/20261024000000_reconcile_offline_sync_and_close_rpcs.sql"], capture_output=True, text=True)
+    assert apply_res.returncode == 0, f"Failed to apply reconciliation migration: {apply_res.stderr}"
+
+    test_caller_id = "rep-open-close"
+    test_client_id = f"open-close-{uuid4()}"
+
+    # 1. Create open call with outcome IS NULL and ended_at IS NULL
+    ins_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        INSERT INTO public.calls (
+          caller_id, client_call_id, prospect_name, company_name, current_stage_id, started_at, outcome, ended_at
+        ) VALUES (
+          '{test_caller_id}', '{test_client_id}', 'Open Prospect', 'Open Corp', 'opening', NOW(), NULL, NULL
+        ) RETURNING id, (outcome IS NULL), (ended_at IS NULL);
+        """
+    ]
+    ins_res = subprocess.run(ins_cmd, capture_output=True, text=True)
+    assert ins_res.returncode == 0, f"Insert failed: {ins_res.stderr}"
+    call_id, out_null, end_null = ins_res.stdout.strip().splitlines()[0].split("|")
+    assert out_null == "t" and end_null == "t", "Call was not created as open with null outcome/ended_at"
+
+    # 2. Call close_call_transaction with valid outcome under service_role
+    close_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SET ROLE service_role;
+        SELECT public.close_call_transaction(
+          '{call_id}'::uuid,
+          '{test_caller_id}',
+          'caller',
+          'meeting_booked',
+          'Initial close notes',
+          NOW()
+        );
+        """
+    ]
+    close_res = subprocess.run(close_cmd, capture_output=True, text=True)
+    assert close_res.returncode == 0, f"Close failed: {close_res.stderr}"
+    raw_lines = [l.strip() for l in close_res.stdout.strip().splitlines() if l.strip() and not l.startswith("SET")]
+    close_data = json.loads(raw_lines[-1])
+    assert close_data["id"] == call_id
+    assert close_data["outcome"] == "meeting_booked"
+    assert close_data["ended_at"] is not None
+
+    # 3. Verify in PostgreSQL database table that outcome and ended_at are stored
+    chk_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SELECT outcome, outcome_notes, (ended_at IS NOT NULL), ended_at::text
+        FROM public.calls WHERE id = '{call_id}';
+        """
+    ]
+    chk_res = subprocess.run(chk_cmd, capture_output=True, text=True)
+    persisted_outcome, persisted_notes, has_ended_at, persisted_ended_at = chk_res.stdout.strip().split("|")
+    assert persisted_outcome == "meeting_booked"
+    assert persisted_notes == "Initial close notes"
+    assert has_ended_at == "t"
+
+    # 4. Retry with matching outcome: idempotent behavior preserves original finalization metadata
+    retry_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SET ROLE service_role;
+        SELECT public.close_call_transaction(
+          '{call_id}'::uuid,
+          '{test_caller_id}',
+          'caller',
+          'meeting_booked',
+          'New retry notes that must be ignored',
+          NOW() + interval '1 hour'
+        );
+        """
+    ]
+    retry_res = subprocess.run(retry_cmd, capture_output=True, text=True)
+    assert retry_res.returncode == 0, f"Matching retry failed: {retry_res.stderr}"
+    raw_retry = [l.strip() for l in retry_res.stdout.strip().splitlines() if l.strip() and not l.startswith("SET")]
+    retry_data = json.loads(raw_retry[-1])
+    assert retry_data["outcome"] == "meeting_booked"
+    assert retry_data["outcome_notes"] == "Initial close notes"
+
+    # Verify database still has original notes and original timestamp
+    chk2 = subprocess.run(chk_cmd, capture_output=True, text=True)
+    p_out2, p_notes2, _, p_end2 = chk2.stdout.strip().split("|")
+    assert p_out2 == "meeting_booked"
+    assert p_notes2 == "Initial close notes"
+    assert p_end2 == persisted_ended_at
+
+    # 5. Retry with conflicting outcome: raises 23505 conflict exception
+    conflict_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SET ROLE service_role;
+        SELECT public.close_call_transaction(
+          '{call_id}'::uuid,
+          '{test_caller_id}',
+          'caller',
+          'not_interested',
+          'Conflicting outcome notes',
+          NOW()
+        );
+        """
+    ]
+    conflict_res = subprocess.run(conflict_cmd, capture_output=True, text=True)
+    assert conflict_res.returncode != 0
+    assert "23505" in conflict_res.stderr or "already finalized with outcome" in conflict_res.stderr
+
+    # 6. Verify caller isolation: unauthorized caller cannot close call
+    unauth_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SET ROLE service_role;
+        SELECT public.close_call_transaction(
+          '{call_id}'::uuid,
+          'unauthorized-rep',
+          'caller',
+          'meeting_booked',
+          'Unauthorized close attempt',
+          NOW()
+        );
+        """
+    ]
+    unauth_res = subprocess.run(unauth_cmd, capture_output=True, text=True)
+    assert unauth_res.returncode != 0
+    assert "42501" in unauth_res.stderr or "Forbidden" in unauth_res.stderr
+
+
+def test_real_postgresql_close_call_guards_and_validation():
+    """
+    REAL POSTGRESQL TEST: Validates SQL-level guards on close_call_transaction:
+    1. Rejects NULL, blank, whitespace-only, whitespace-padded, and unsupported outcomes.
+    2. Rejects NULL and blank caller identity.
+    3. Rejects NULL and unsupported caller roles.
+    4. Validates IS DISTINCT FROM caller check while preserving admin exception.
+    """
+    if not _check_real_postgres():
+        pytest.skip("Local PostgreSQL database coldcall_test not available")
+
+    apply_res = subprocess.run([PSQL_BIN, "-v", "ON_ERROR_STOP=1", "-d", "coldcall_test", "-f", "supabase/migrations/20261024000000_reconcile_offline_sync_and_close_rpcs.sql"], capture_output=True, text=True)
+    assert apply_res.returncode == 0, f"Failed to apply migration: {apply_res.stderr}"
+
+    def create_open_call(caller_id):
+        ins = subprocess.run(
+            [PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+             f"INSERT INTO public.calls (caller_id, client_call_id, current_stage_id, started_at) VALUES ('{caller_id}', 'guard-{uuid4()}', 'opening', NOW()) RETURNING id;"],
+            capture_output=True, text=True
+        )
+        assert ins.returncode == 0
+        return ins.stdout.strip().splitlines()[0]
+
+    # 1. OUTCOME GUARDS on open call
+    cid1 = create_open_call("rep-guards")
+
+    # 1a. NULL outcome
+    r_null = subprocess.run([PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"SELECT public.close_call_transaction('{cid1}'::uuid, 'rep-guards', 'caller', NULL);"],
+        capture_output=True, text=True)
+    assert r_null.returncode != 0
+    assert "DataIntegrityError" in r_null.stderr and "Outcome cannot be null or blank" in r_null.stderr
+
+    # 1b. Blank outcome
+    r_blank = subprocess.run([PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"SELECT public.close_call_transaction('{cid1}'::uuid, 'rep-guards', 'caller', '');"],
+        capture_output=True, text=True)
+    assert r_blank.returncode != 0
+    assert "DataIntegrityError" in r_blank.stderr and "Outcome cannot be null or blank" in r_blank.stderr
+
+    # 1c. Whitespace-only outcome
+    r_ws = subprocess.run([PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"SELECT public.close_call_transaction('{cid1}'::uuid, 'rep-guards', 'caller', '   ');"],
+        capture_output=True, text=True)
+    assert r_ws.returncode != 0
+    assert "DataIntegrityError" in r_ws.stderr and "Outcome cannot be null or blank" in r_ws.stderr
+
+    # 1d. Whitespace-padded outcome
+    r_pad = subprocess.run([PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"SELECT public.close_call_transaction('{cid1}'::uuid, 'rep-guards', 'caller', ' meeting_booked ');"],
+        capture_output=True, text=True)
+    assert r_pad.returncode != 0
+    assert "DataIntegrityError" in r_pad.stderr and "Outcome cannot contain leading or trailing whitespace" in r_pad.stderr
+
+    # 1e. Unsupported outcome
+    r_unsupp = subprocess.run([PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"SELECT public.close_call_transaction('{cid1}'::uuid, 'rep-guards', 'caller', 'unsupported_outcome');"],
+        capture_output=True, text=True)
+    assert r_unsupp.returncode != 0
+    assert "DataIntegrityError" in r_unsupp.stderr and "Invalid outcome" in r_unsupp.stderr
+
+    # 2. CALLER IDENTITY GUARDS
+    # 2a. NULL caller identity
+    r_cid_null = subprocess.run([PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"SELECT public.close_call_transaction('{cid1}'::uuid, NULL, 'caller', 'meeting_booked');"],
+        capture_output=True, text=True)
+    assert r_cid_null.returncode != 0
+    assert "Unauthorized" in r_cid_null.stderr and "Caller ID cannot be null or blank" in r_cid_null.stderr
+
+    # 2b. Blank caller identity
+    r_cid_blank = subprocess.run([PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"SELECT public.close_call_transaction('{cid1}'::uuid, '   ', 'caller', 'meeting_booked');"],
+        capture_output=True, text=True)
+    assert r_cid_blank.returncode != 0
+    assert "Unauthorized" in r_cid_blank.stderr and "Caller ID cannot be null or blank" in r_cid_blank.stderr
+
+    # 3. CALLER ROLE GUARDS
+    # 3a. NULL caller role
+    r_role_null = subprocess.run([PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"SELECT public.close_call_transaction('{cid1}'::uuid, 'rep-guards', NULL, 'meeting_booked');"],
+        capture_output=True, text=True)
+    assert r_role_null.returncode != 0
+    assert "Unauthorized" in r_role_null.stderr and "Invalid caller role" in r_role_null.stderr
+
+    # 3b. Unsupported caller role
+    r_role_unsupp = subprocess.run([PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"SELECT public.close_call_transaction('{cid1}'::uuid, 'rep-guards', 'superadmin', 'meeting_booked');"],
+        capture_output=True, text=True)
+    assert r_role_unsupp.returncode != 0
+    assert "Unauthorized" in r_role_unsupp.stderr and "Invalid caller role" in r_role_unsupp.stderr
+
+    # 4. ADMIN ROLE OVERRIDE: Admin can close a call owned by a different caller
+    r_admin = subprocess.run([PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"SELECT public.close_call_transaction('{cid1}'::uuid, 'admin-user', 'admin', 'meeting_booked', 'Admin closed', NOW());"],
+        capture_output=True, text=True)
+    assert r_admin.returncode == 0, f"Admin close failed: {r_admin.stderr}"
+    res_admin = json.loads(r_admin.stdout.strip().splitlines()[-1])
+    assert res_admin["outcome"] == "meeting_booked"
+    assert res_admin["outcome_notes"] == "Admin closed"
+
+
+
+def test_real_postgresql_rpc_outcome_alignment_and_retries():
+    """
+    REAL POSTGRESQL TEST: Proves that sync_offline_call_transaction and
+    close_call_transaction enforce the exact same canonical outcome whitelist:
+    1. Every one of the 11 canonical outcomes is accepted by sync_offline_call_transaction.
+    2. Every one of the 11 canonical outcomes is accepted by close_call_transaction.
+    3. Matching finalization retries preserve original metadata for all 11 outcomes across both RPCs.
+    4. Disallowed outcomes (gatekeeper_blocked, call_back_later, unknown, casing, blank, whitespace)
+       are strictly rejected by BOTH RPCs with 23514 DataIntegrityError.
+    5. Conflicting outcome retries are strictly rejected by BOTH RPCs with 23505 Conflict.
+    """
+    if not _check_real_postgres():
+        pytest.skip("Local PostgreSQL database coldcall_test not available")
+
+    # Apply forward reconciliation migration
+    apply_res = subprocess.run(
+        [PSQL_BIN, "-v", "ON_ERROR_STOP=1", "-d", "coldcall_test", "-f", "supabase/migrations/20261024000000_reconcile_offline_sync_and_close_rpcs.sql"],
+        capture_output=True, text=True
+    )
+    assert apply_res.returncode == 0, f"Migration failed: {apply_res.stderr}"
+
+    canonical_outcomes = [
+        "meeting_booked",
+        "next_step_agreed",
+        "agreed_to_receive_report",
+        "follow_up",
+        "interested",
+        "not_interested",
+        "do_not_call",
+        "wrong_person",
+        "moved_company",
+        "no_answer",
+        "other",
+    ]
+    assert set(canonical_outcomes) == ALLOWED_OUTCOMES, "Canonical test list does not match backend ALLOWED_OUTCOMES"
+
+    # 1 & 2: Test all 11 outcomes and matching retries across BOTH RPCs
+    for outcome in canonical_outcomes:
+        # --- A. Test sync_offline_call_transaction ---
+        sync_client_id = f"sync-all-{outcome}-{uuid4()}"
+        initial_sync_notes = f"Initial sync notes for {outcome}"
+        sync_cmd = [
+            PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+            f"""
+            SET ROLE service_role;
+            SELECT public.sync_offline_call_transaction(
+              'rep-all-outcomes',
+              '{sync_client_id}',
+              'Prospect {outcome}',
+              'Company {outcome}',
+              'opening',
+              NOW(),
+              NOW(),
+              '{outcome}',
+              '{initial_sync_notes}',
+              '[]'::jsonb
+            );
+            """
+        ]
+        r_sync = subprocess.run(sync_cmd, capture_output=True, text=True)
+        assert r_sync.returncode == 0, f"sync RPC rejected canonical outcome '{outcome}': {r_sync.stderr}"
+        raw_sync = [l.strip() for l in r_sync.stdout.strip().splitlines() if l.strip() and not l.startswith("SET")]
+        data_sync = json.loads(raw_sync[-1])
+        assert data_sync["outcome"] == outcome
+        assert data_sync["outcome_notes"] == initial_sync_notes
+        assert data_sync["ended_at"] is not None
+
+        # Verify matching retry on sync RPC preserves initial metadata
+        retry_sync_cmd = [
+            PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+            f"""
+            SET ROLE service_role;
+            SELECT public.sync_offline_call_transaction(
+              'rep-all-outcomes',
+              '{sync_client_id}',
+              'Prospect {outcome}',
+              'Company {outcome}',
+              'opening',
+              NOW(),
+              NOW() + interval '1 hour',
+              '{outcome}',
+              'Mutated notes that must be ignored',
+              '[]'::jsonb
+            );
+            """
+        ]
+        r_sync_retry = subprocess.run(retry_sync_cmd, capture_output=True, text=True)
+        assert r_sync_retry.returncode == 0, f"sync retry failed for '{outcome}': {r_sync_retry.stderr}"
+        data_sync_retry = json.loads([l.strip() for l in r_sync_retry.stdout.strip().splitlines() if l.strip() and not l.startswith("SET")][-1])
+        assert data_sync_retry["outcome"] == outcome
+        assert data_sync_retry["outcome_notes"] == initial_sync_notes
+        assert data_sync_retry["ended_at"] == data_sync["ended_at"]
+
+        # --- B. Test close_call_transaction ---
+        ins_cmd = [
+            PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+            f"INSERT INTO public.calls (caller_id, client_call_id, current_stage_id, started_at) VALUES ('rep-all-outcomes', 'open-{outcome}-{uuid4()}', 'opening', NOW()) RETURNING id;"
+        ]
+        r_ins = subprocess.run(ins_cmd, capture_output=True, text=True)
+        assert r_ins.returncode == 0, f"Insert open call failed: {r_ins.stderr}"
+        open_call_id = r_ins.stdout.strip().splitlines()[0]
+
+        initial_close_notes = f"Initial close notes for {outcome}"
+        close_cmd = [
+            PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+            f"""
+            SET ROLE service_role;
+            SELECT public.close_call_transaction(
+              '{open_call_id}'::uuid,
+              'rep-all-outcomes',
+              'caller',
+              '{outcome}',
+              '{initial_close_notes}',
+              NOW()
+            );
+            """
+        ]
+        r_close = subprocess.run(close_cmd, capture_output=True, text=True)
+        assert r_close.returncode == 0, f"close RPC rejected canonical outcome '{outcome}': {r_close.stderr}"
+        raw_close = [l.strip() for l in r_close.stdout.strip().splitlines() if l.strip() and not l.startswith("SET")]
+        data_close = json.loads(raw_close[-1])
+        assert data_close["outcome"] == outcome
+        assert data_close["outcome_notes"] == initial_close_notes
+        assert data_close["ended_at"] is not None
+
+        # Verify matching retry on close RPC preserves initial metadata
+        retry_close_cmd = [
+            PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+            f"""
+            SET ROLE service_role;
+            SELECT public.close_call_transaction(
+              '{open_call_id}'::uuid,
+              'rep-all-outcomes',
+              'caller',
+              '{outcome}',
+              'Mutated close notes that must be ignored',
+              NOW() + interval '2 hours'
+            );
+            """
+        ]
+        r_close_retry = subprocess.run(retry_close_cmd, capture_output=True, text=True)
+        assert r_close_retry.returncode == 0, f"close retry failed for '{outcome}': {r_close_retry.stderr}"
+        data_close_retry = json.loads([l.strip() for l in r_close_retry.stdout.strip().splitlines() if l.strip() and not l.startswith("SET")][-1])
+        assert data_close_retry["outcome"] == outcome
+        assert data_close_retry["outcome_notes"] == initial_close_notes
+        assert data_close_retry["ended_at"] == data_close["ended_at"]
+
+    # 3. Test disallowed outcomes: both RPCs must reject them
+    disallowed_outcomes = [
+        "gatekeeper_blocked",
+        "call_back_later",
+        "invalid_random_choice",
+        "MEETING_BOOKED",
+        "not-interested",
+        "",
+        "   ",
+        " meeting_booked ",
+        "wrong_person ",
+    ]
+
+    for bad_outcome in disallowed_outcomes:
+        # --- A. sync_offline_call_transaction must reject ---
+        escaped_bad = bad_outcome.replace("'", "''")
+        bad_sync_cmd = [
+            PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+            f"""
+            SET ROLE service_role;
+            SELECT public.sync_offline_call_transaction(
+              'rep-all-outcomes',
+              'bad-sync-{uuid4()}',
+              'Bad Outcome Prospect',
+              'Bad Corp',
+              'opening',
+              NOW(),
+              NOW(),
+              '{escaped_bad}',
+              'Note',
+              '[]'::jsonb
+            );
+            """
+        ]
+        r_bad_sync = subprocess.run(bad_sync_cmd, capture_output=True, text=True)
+        assert r_bad_sync.returncode != 0, f"sync RPC unexpectedly accepted disallowed outcome '{bad_outcome}'"
+        assert "DataIntegrityError" in r_bad_sync.stderr, f"sync RPC did not raise DataIntegrityError for '{bad_outcome}': {r_bad_sync.stderr}"
+
+        # --- B. close_call_transaction must reject ---
+        ins_bad_cmd = [
+            PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+            f"INSERT INTO public.calls (caller_id, client_call_id, current_stage_id, started_at) VALUES ('rep-all-outcomes', 'bad-open-{uuid4()}', 'opening', NOW()) RETURNING id;"
+        ]
+        r_bad_ins = subprocess.run(ins_bad_cmd, capture_output=True, text=True)
+        bad_call_id = r_bad_ins.stdout.strip().splitlines()[0]
+
+        bad_close_cmd = [
+            PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+            f"""
+            SET ROLE service_role;
+            SELECT public.close_call_transaction(
+              '{bad_call_id}'::uuid,
+              'rep-all-outcomes',
+              'caller',
+              '{escaped_bad}',
+              'Bad close note',
+              NOW()
+            );
+            """
+        ]
+        r_bad_close = subprocess.run(bad_close_cmd, capture_output=True, text=True)
+        assert r_bad_close.returncode != 0, f"close RPC unexpectedly accepted disallowed outcome '{bad_outcome}'"
+        assert "DataIntegrityError" in r_bad_close.stderr, f"close RPC did not raise DataIntegrityError for '{bad_outcome}': {r_bad_close.stderr}"
+
+    # 4. Conflicting outcome retries: both RPCs must reject divergent outcomes with 23505 Conflict
+    # Sync conflict
+    conflict_sync_id = f"sync-conflict-{uuid4()}"
+    subprocess.run([
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SET ROLE service_role;
+        SELECT public.sync_offline_call_transaction(
+          'rep-all-outcomes', '{conflict_sync_id}', 'P', 'C', 'opening', NOW(), NOW(),
+          'meeting_booked', 'Initial note', '[]'::jsonb
+        );
+        """
+    ], check=True)
+
+    r_sync_conflict = subprocess.run([
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SET ROLE service_role;
+        SELECT public.sync_offline_call_transaction(
+          'rep-all-outcomes', '{conflict_sync_id}', 'P', 'C', 'opening', NOW(), NOW(),
+          'moved_company', 'Conflicting note', '[]'::jsonb
+        );
+        """
+    ], capture_output=True, text=True)
+    assert r_sync_conflict.returncode != 0
+    assert "23505" in r_sync_conflict.stderr or "Conflict" in r_sync_conflict.stderr
+
+    # Close conflict
+    ins_conflict_cmd = [
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"INSERT INTO public.calls (caller_id, client_call_id, current_stage_id, started_at) VALUES ('rep-all-outcomes', 'conflict-open-{uuid4()}', 'opening', NOW()) RETURNING id;"
+    ]
+    r_cf_ins = subprocess.run(ins_conflict_cmd, capture_output=True, text=True)
+    conflict_call_id = r_cf_ins.stdout.strip().splitlines()[0]
+
+    subprocess.run([
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SET ROLE service_role;
+        SELECT public.close_call_transaction(
+          '{conflict_call_id}'::uuid, 'rep-all-outcomes', 'caller',
+          'meeting_booked', 'Initial close', NOW()
+        );
+        """
+    ], check=True)
+
+    r_close_conflict = subprocess.run([
+        PSQL_BIN, "-d", "coldcall_test", "-t", "-A", "-c",
+        f"""
+        SET ROLE service_role;
+        SELECT public.close_call_transaction(
+          '{conflict_call_id}'::uuid, 'rep-all-outcomes', 'caller',
+          'wrong_person', 'Conflicting close', NOW()
+        );
+        """
+    ], capture_output=True, text=True)
+    assert r_close_conflict.returncode != 0
+    assert "23505" in r_close_conflict.stderr or "already finalized with outcome" in r_close_conflict.stderr
+
+
+# -----------------------------------------------------------------------------
+# Contact Form & Support Dispatch Tests
+# -----------------------------------------------------------------------------
+def test_contact_unconfigured_returns_503(monkeypatch):
+    monkeypatch.delenv("CONTACT_WEBHOOK_URL", raising=False)
+    # Clear rate limit state
+    from app import _contact_rate_limit
+    _contact_rate_limit.clear()
+
+    res = client.post("/contact", json={
+        "name": "Alex",
+        "email": "alex@example.com",
+        "message": "Interested in trying Sidecall for our SDR team."
+    })
+    assert res.status_code == 503
+    assert "destination is not configured" in res.json()["detail"]
+
+
+def test_contact_validation_errors():
+    # Invalid email
+    res = client.post("/contact", json={
+        "name": "Alex",
+        "email": "invalid-email-no-at",
+        "message": "Hello there"
+    })
+    assert res.status_code == 422
+
+    # Short message
+    res = client.post("/contact", json={
+        "name": "Alex",
+        "email": "alex@example.com",
+        "message": "Hi"
+    })
+    assert res.status_code == 422
+
+
+def test_contact_honeypot_dropped_silently(monkeypatch):
+    monkeypatch.delenv("CONTACT_WEBHOOK_URL", raising=False)
+    # If honeypot is populated, it should succeed without calling webhook or returning 503
+    res = client.post("/contact", json={
+        "name": "SpamBot",
+        "email": "bot@spammer.org",
+        "message": "Buy cheap watches at our site now",
+        "honeypot": "https://spam.link"
+    })
+    assert res.status_code == 200
+    assert res.json()["status"] == "received"
+
+
+def test_contact_configured_webhook_success(monkeypatch):
+    from unittest.mock import AsyncMock, patch
+
+    monkeypatch.setenv("CONTACT_WEBHOOK_URL", "https://hooks.example.com/services/test-webhook")
+    from app import _contact_rate_limit
+    _contact_rate_limit.clear()
+
+    mock_resp = AsyncMock()
+    mock_resp.raise_for_status = lambda: None
+
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+
+        res = client.post("/contact", json={
+            "name": "Morgan",
+            "email": "morgan@company.com",
+            "message": "How do we deploy this for a 10-person outbound sales pod?"
+        })
+        assert res.status_code == 200
+        assert res.json()["status"] == "received"
+        assert mock_post.called
+        call_kwargs = mock_post.call_args.kwargs
+        assert call_kwargs["json"]["email"] == "morgan@company.com"
+        assert call_kwargs["json"]["name"] == "Morgan"
+
+
+def test_contact_rate_limiting_enforced(monkeypatch):
+    from app import _contact_rate_limit
+    _contact_rate_limit.clear()
+    monkeypatch.setenv("CONTACT_WEBHOOK_URL", "https://hooks.example.com/services/test-webhook")
+
+    from unittest.mock import AsyncMock, patch
+    mock_resp = AsyncMock()
+    mock_resp.raise_for_status = lambda: None
+
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+
+        for i in range(5):
+            r = client.post("/contact", json={
+                "email": f"rep{i}@example.com",
+                "message": "Checking out the application."
+            })
+            assert r.status_code == 200
+
+        # 6th request should hit rate limit
+        r_blocked = client.post("/contact", json={
+            "email": "rep6@example.com",
+            "message": "Another quick message."
+        })
+        assert r_blocked.status_code == 429
+        assert "Too many" in r_blocked.json()["detail"]
+
+
+def test_contact_cors_preflight_and_origin_headers():
+    # CORS preflight verification from allowed frontend origin
+    res = client.options("/contact", headers={
+        "Origin": "http://localhost:5173",
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type",
+    })
+    assert res.status_code == 200
+    assert res.headers.get("access-control-allow-origin") == "http://localhost:5173"
+    assert "POST" in res.headers.get("access-control-allow-methods", "")
+
+
+def test_contact_slack_and_discord_payload_structure(monkeypatch):
+    from unittest.mock import AsyncMock, patch
+    from app import _contact_rate_limit
+    _contact_rate_limit.clear()
+
+    monkeypatch.setenv("CONTACT_WEBHOOK_URL", "https://hooks.slack.com/services/T00/B00/X00")
+
+    mock_resp = AsyncMock()
+    mock_resp.status_code = 200
+    mock_resp.raise_for_status = lambda: None
+
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+
+        res = client.post("/contact", json={
+            "name": "Taylor",
+            "email": "taylor@enterprise.com",
+            "message": "Testing Slack payload formatting."
+        })
+        assert res.status_code == 200
+        assert mock_post.called
+
+        payload = mock_post.call_args.kwargs["json"]
+        # Must have Slack required 'text' key
+        assert "text" in payload
+        assert "Taylor" in payload["text"]
+        assert "taylor@enterprise.com" in payload["text"]
+        # Must have Discord required 'content' key
+        assert "content" in payload
+        # Must preserve structured fields for CRM/Zapier
+        assert payload["email"] == "taylor@enterprise.com"
+        assert payload["name"] == "Taylor"
+
+
+def test_contact_proxy_ip_rate_limiting_with_forwarded_for(monkeypatch):
+    from app import _contact_rate_limit
+    _contact_rate_limit.clear()
+    monkeypatch.setenv("CONTACT_WEBHOOK_URL", "https://hooks.example.com/services/test-webhook")
+
+    from unittest.mock import AsyncMock, patch
+    mock_resp = AsyncMock()
+    mock_resp.raise_for_status = lambda: None
+
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+
+        client_a_headers = {"X-Forwarded-For": "203.0.113.50, 10.0.0.1"}
+        client_b_headers = {"X-Forwarded-For": "198.51.100.88, 10.0.0.1"}
+
+        # Client A sends 5 requests -> all pass
+        for i in range(5):
+            r = client.post("/contact", json={
+                "email": f"repA{i}@example.com",
+                "message": "Inquiry from Client A."
+            }, headers=client_a_headers)
+            assert r.status_code == 200
+
+        # Client A 6th request -> 429
+        r_blocked = client.post("/contact", json={
+            "email": "repA6@example.com",
+            "message": "Another inquiry from Client A."
+        }, headers=client_a_headers)
+        assert r_blocked.status_code == 429
+
+        # Client B sends request through the same proxy -> SUCCEEDS (independent rate limit)
+        r_b_ok = client.post("/contact", json={
+            "email": "repB@example.com",
+            "message": "Inquiry from Client B behind same proxy."
+        }, headers=client_b_headers)
+        assert r_b_ok.status_code == 200
+
+
+def test_untrusted_direct_connection_ignores_spoofed_headers(monkeypatch):
+    """
+    Security check: An untrusted direct caller cannot bypass rate limiting
+    by sending arbitrary X-Forwarded-For, CF-Connecting-IP, or X-Real-IP headers.
+    """
+    from app import app, _contact_rate_limit
+    from starlette.testclient import TestClient
+    from unittest.mock import AsyncMock, patch
+
+    _contact_rate_limit.clear()
+    monkeypatch.setenv("CONTACT_WEBHOOK_URL", "https://hooks.example.com/services/test-webhook")
+    monkeypatch.delenv("TRUSTED_PROXY_IPS", raising=False)
+
+    mock_resp = AsyncMock()
+    mock_resp.raise_for_status = lambda: None
+
+    # Simulate direct connection from untrusted public IP 198.51.100.200
+    direct_client = TestClient(app, client=("198.51.100.200", 50000))
+
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+
+        # Direct caller attempts to spoof 5 different client IPs
+        for i in range(5):
+            res = direct_client.post("/contact", json={
+                "email": f"attacker{i}@test.com",
+                "message": "Direct message attempt."
+            }, headers={
+                "X-Forwarded-For": f"1.2.3.{i}",
+                "CF-Connecting-IP": f"2.3.4.{i}",
+                "X-Real-IP": f"3.4.5.{i}",
+            })
+            assert res.status_code == 200
+
+        # 6th request with a brand new spoofed IP is STILL blocked because the socket host is 198.51.100.200
+        res_blocked = direct_client.post("/contact", json={
+            "email": "attacker6@test.com",
+            "message": "Blocked direct attempt."
+        }, headers={
+            "X-Forwarded-For": "9.9.9.9",
+            "CF-Connecting-IP": "8.8.8.8",
+        })
+        assert res_blocked.status_code == 429
+        assert "Too many" in res_blocked.json()["detail"]
+
+
+def test_configured_trusted_proxy_cidr_accepts_forwarded_headers(monkeypatch):
+    """
+    Security check: Forwarded headers are accepted when the socket connection
+    matches an explicitly configured TRUSTED_PROXY_IPS CIDR network.
+    """
+    from app import app, _contact_rate_limit
+    from starlette.testclient import TestClient
+    from unittest.mock import AsyncMock, patch
+
+    _contact_rate_limit.clear()
+    monkeypatch.setenv("CONTACT_WEBHOOK_URL", "https://hooks.example.com/services/test-webhook")
+    # Configure 10.0.0.0/8 as a trusted proxy subnet (e.g. cloud internal reverse proxy)
+    monkeypatch.setenv("TRUSTED_PROXY_IPS", "10.0.0.0/8")
+
+    mock_resp = AsyncMock()
+    mock_resp.raise_for_status = lambda: None
+
+    # Proxy socket IP inside the trusted 10.0.0.0/8 subnet
+    proxy_client = TestClient(app, client=("10.2.3.4", 50000))
+
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+
+        # Request routed through trusted proxy from real client 203.0.113.77
+        res = proxy_client.post("/contact", json={
+            "email": "legit@client.com",
+            "message": "Legitimate inquiry through trusted proxy."
+        }, headers={
+            "X-Forwarded-For": "203.0.113.77, 10.2.3.4"
+        })
+        assert res.status_code == 200
+        # Verify rate limit bucket was assigned to the client 203.0.113.77, not the proxy 10.2.3.4
+        assert "203.0.113.77" in _contact_rate_limit
+        assert "10.2.3.4" not in _contact_rate_limit
+
+
+def test_trusted_proxy_forwarded_ip_syntax_validation(monkeypatch):
+    """
+    Ensures forwarded IP strings are safely validated, ports are stripped,
+    and corrupted/malformed IP headers fall back gracefully.
+    """
+    from app import app, _contact_rate_limit
+    from starlette.testclient import TestClient
+    from unittest.mock import AsyncMock, patch
+
+    _contact_rate_limit.clear()
+    monkeypatch.setenv("CONTACT_WEBHOOK_URL", "https://hooks.example.com/services/test-webhook")
+    monkeypatch.setenv("TRUSTED_PROXY_IPS", "127.0.0.1")
+
+    mock_resp = AsyncMock()
+    mock_resp.raise_for_status = lambda: None
+
+    proxy_client = TestClient(app, client=("127.0.0.1", 50000))
+
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+
+        # 1. IPv4 with port
+        res1 = proxy_client.post("/contact", json={
+            "email": "user1@test.com", "message": "Testing port stripping."
+        }, headers={"X-Forwarded-For": "198.51.100.42:54321"})
+        assert res1.status_code == 200
+        assert "198.51.100.42" in _contact_rate_limit
+
+        # 2. Bracketed IPv6 with port
+        res2 = proxy_client.post("/contact", json={
+            "email": "user2@test.com", "message": "Testing IPv6 bracket stripping."
+        }, headers={"X-Forwarded-For": "[2001:db8::99]:8080"})
+        assert res2.status_code == 200
+        assert "2001:db8::99" in _contact_rate_limit
+
+        # 3. Corrupted / non-IP candidate falls back to proxy host 127.0.0.1 without crashing
+        res3 = proxy_client.post("/contact", json={
+            "email": "user3@test.com", "message": "Testing malformed IP header."
+        }, headers={"X-Forwarded-For": "malicious-injection-string; DROP TABLE;"})
+        assert res3.status_code == 200
+        assert "127.0.0.1" in _contact_rate_limit

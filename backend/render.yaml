@@ -6,3 +6,20 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.9
+      - key: CORS_ORIGINS
+        value: https://coldcall-companion.vercel.app,http://localhost:5173
+      - key: TRUST_PRIVATE_PROXIES
+        value: "true"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: CALLER_AUTH_TOKENS
+        sync: false
+      - key: CONTACT_WEBHOOK_URL
+        sync: false
+      - key: LLM_API_KEY
+        sync: false

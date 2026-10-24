@@ -11,7 +11,9 @@ import {
   CloudOff,
   FileText,
   Headphones,
+  HelpCircle,
   History,
+  Mail,
   MessageSquare,
   Phone,
   PhoneOff,
@@ -26,7 +28,25 @@ import {
 } from 'lucide-react';
 import './styles.css';
 
-const API = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/$/, '');
+function resolveApiBaseUrl() {
+  const configured = (import.meta.env.VITE_API_BASE_URL || '').trim().replace(/\/$/, '');
+  if (configured) return configured;
+  // In development, default to local backend server
+  if (import.meta.env.DEV) {
+    return 'http://localhost:8000';
+  }
+  // In production, NEVER silently fall back to localhost:8000 (which targets visitor's machine).
+  // Return empty string for relative paths (/api or reverse proxy), and warn in console.
+  if (typeof console !== 'undefined' && console.warn) {
+    console.warn(
+      '[Sidecall Deployment] VITE_API_BASE_URL is not configured in production. ' +
+      'Requests will use relative endpoints. For separate backend deployments, configure VITE_API_BASE_URL in your hosting build variables.'
+    );
+  }
+  return '';
+}
+
+const API = resolveApiBaseUrl();
 
 // 8 authentic cold call stages derived from DeepThought structure & empirical analysis of 100 transcripts
 const STAGE_SEED = [
@@ -187,6 +207,15 @@ async function request(path, options = {}) {
       ...options,
     });
     clearTimeout(timeoutId);
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.includes('application/json')) {
+      const err = new Error(
+        `Expected JSON response but received ${contentType || 'non-JSON'} from ${path}. ` +
+        `Ensure VITE_API_BASE_URL is configured for your backend origin.`
+      );
+      err.status = res.status;
+      throw err;
+    }
     const body = await res.json().catch(() => ({}));
     if (!res.ok) {
       const err = new Error(body.detail || `Request failed (${res.status})`);
@@ -260,6 +289,12 @@ function App() {
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const [tokenInput, setTokenInput] = useState(getCallerToken());
 
+  // Pre-launch checklist: Privacy modal & contact form state
+  const [privacyModalOpen, setPrivacyModalOpen] = useState(false);
+  const [contactModalOpen, setContactModalOpen] = useState(false);
+  const [contactForm, setContactForm] = useState({ name: '', email: '', message: '', honeypot: '' });
+  const [contactStatus, setContactStatus] = useState({ state: 'idle', message: '' }); // 'idle' | 'submitting' | 'success' | 'error'
+
   // Status & communication
   const [busy, setBusy] = useState(false);
   const [savingStage, setSavingStage] = useState(false);
@@ -322,6 +357,109 @@ function App() {
 
     loadHistory();
   }, []);
+
+  // Pre-launch checklist: Dynamic SEO page titles reflecting actual view & call context
+  useEffect(() => {
+    if (screen === 'call') {
+      if (activeCall) {
+        const prospect = activeCall.prospect_name || 'Prospect';
+        const company = activeCall.company_name ? ` (${activeCall.company_name})` : '';
+        document.title = `Live: ${prospect}${company} — Sidecall`;
+      } else {
+        document.title = 'Sidecall — Cold Call Companion';
+      }
+    } else if (screen === 'history') {
+      document.title = 'Call History & Records — Sidecall';
+    } else if (screen === 'detail') {
+      if (detailCall) {
+        const prospect = detailCall.prospect_name || 'Prospect';
+        document.title = `Record: ${prospect} — Sidecall`;
+      } else {
+        document.title = 'Record Not Found — Sidecall';
+      }
+    }
+  }, [screen, activeCall, detailCall]);
+
+  // Pre-launch checklist: Privacy-conscious Google Analytics loader (only if operator configured ID)
+  useEffect(() => {
+    const gaId = import.meta.env.VITE_GA_MEASUREMENT_ID;
+    if (!gaId || window.__gaLoaded) return;
+    window.__gaLoaded = true;
+    const script = document.createElement('script');
+    script.async = true;
+    script.src = `https://www.googletagmanager.com/gtag/js?id=${gaId}`;
+    document.head.appendChild(script);
+
+    window.dataLayer = window.dataLayer || [];
+    function gtag() {
+      window.dataLayer.push(arguments);
+    }
+    gtag('js', new Date());
+    gtag('config', gaId, { anonymize_ip: true });
+  }, []);
+
+  // Pre-launch checklist: Working contact form submission via server-side endpoint or public provider
+  async function handleContactSubmit(e) {
+    e.preventDefault();
+    if (contactForm.honeypot) {
+      setContactStatus({ state: 'success', message: 'Thank you! Your feedback has been received.' });
+      return;
+    }
+    const cleanEmail = contactForm.email.trim();
+    const cleanMsg = contactForm.message.trim();
+    if (!cleanEmail || !cleanEmail.includes('@') || !cleanEmail.includes('.')) {
+      setContactStatus({ state: 'error', message: 'Please enter a valid email address.' });
+      return;
+    }
+    if (!cleanMsg || cleanMsg.length < 5) {
+      setContactStatus({ state: 'error', message: 'Please enter a message of at least 5 characters.' });
+      return;
+    }
+
+    setContactStatus({ state: 'submitting', message: '' });
+
+    // Option A: Provider-supported public form endpoint if explicitly defined (e.g. Formspree ID)
+    const publicEndpoint = import.meta.env.VITE_PUBLIC_CONTACT_ENDPOINT;
+    const targetUrl = publicEndpoint ? publicEndpoint : `${API}/contact`;
+
+    try {
+      const resp = await fetch(targetUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: contactForm.name.trim() || undefined,
+          email: cleanEmail,
+          message: cleanMsg,
+          honeypot: contactForm.honeypot || undefined,
+        }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        if (resp.status === 503) {
+          setContactStatus({
+            state: 'unconfigured',
+            message: 'Contact support is not configured yet. The operator has not connected a verified support destination.'
+          });
+          return;
+        }
+        if (resp.status === 429) {
+          setContactStatus({
+            state: 'error',
+            message: 'Too many messages sent. Please wait several minutes before submitting again.'
+          });
+          return;
+        }
+        throw new Error(data.detail || 'Contact support destination could not be reached.');
+      }
+      setContactStatus({ state: 'success', message: 'Thank you! Your message has been received.' });
+      setContactForm({ name: '', email: '', message: '', honeypot: '' });
+    } catch (err) {
+      setContactStatus({
+        state: 'unconfigured',
+        message: 'Contact support is not configured yet. The server or endpoint is currently unreachable.'
+      });
+    }
+  }
 
   const stage = stages[activeIndex] || STAGE_SEED[0];
   const completedCount = useMemo(() => Object.keys(stageResults).filter(k => stageResults[k]?.result).length, [stageResults]);
@@ -934,6 +1072,27 @@ function App() {
           <History size={19} />
         </button>
         <div className="rail-bottom">
+          <button
+            type="button"
+            className="rail-btn-subtle"
+            title="Privacy Policy"
+            aria-label="Privacy Policy"
+            onClick={() => setPrivacyModalOpen(true)}
+          >
+            <HelpCircle size={18} />
+          </button>
+          <button
+            type="button"
+            className="rail-btn-subtle"
+            title="Contact & Support"
+            aria-label="Contact & Support"
+            onClick={() => {
+              setContactStatus({ state: 'idle', message: '' });
+              setContactModalOpen(true);
+            }}
+          >
+            <Mail size={18} />
+          </button>
           <span
             className={`api-dot ${apiState}`}
             title={`Database status: ${apiState}`}
@@ -945,19 +1104,40 @@ function App() {
       <main className="main-area">
         {/* Top Header Bar */}
         <header className="topbar">
-          <div className="crumb">
-            <span>COLDCALL COMPANION</span>
+          <nav className="crumb" aria-label="Breadcrumb navigation">
+            <button
+              type="button"
+              className="crumb-btn"
+              onClick={() => setScreen('call')}
+            >
+              COLDCALL COMPANION
+            </button>
+            {screen === 'detail' && (
+              <>
+                <span className="slash">/</span>
+                <button
+                  type="button"
+                  className="crumb-btn"
+                  onClick={() => {
+                    setScreen('history');
+                    loadHistory();
+                  }}
+                >
+                  History
+                </button>
+              </>
+            )}
             <span className="slash">/</span>
-            <strong>
+            <strong aria-current="page">
               {screen === 'call'
                 ? activeCall
                   ? 'Live Call in Progress'
                   : 'Start Call'
                 : screen === 'detail'
-                ? 'Call Record Detail'
+                ? (detailCall ? `${detailCall.prospect_name || 'Prospect'} (${detailCall.company_name || 'Organization'})` : 'Record Not Found')
                 : 'Call History'}
             </strong>
-          </div>
+          </nav>
           <div className="top-actions">
             <div className={`connection ${apiState}`}>
               {apiState === 'connected' ? (
@@ -1080,6 +1260,7 @@ function App() {
               </div>
             ) : (
               <div className="lc-workspace">
+                <h1 className="visually-hidden">Live Call Workspace — {activeCall.prospect_name || 'Active Call'}</h1>
                 {/* ── LIVE CALL HEADER BAR ── */}
                 <div className="lc-header">
                   <div className="lc-header-left">
@@ -1510,6 +1691,27 @@ function App() {
                 </div>
               </>
             )}
+            {!detailCall && (
+              <div className="error-404-container">
+                <div className="error-404-icon">
+                  <AlertTriangle size={28} />
+                </div>
+                <h2>Call Record Not Found</h2>
+                <p>
+                  The call record you are trying to view does not exist or has been removed from your local history.
+                </p>
+                <button
+                  type="button"
+                  className="primary-button"
+                  onClick={() => {
+                    setScreen('history');
+                    loadHistory();
+                  }}
+                >
+                  Return to Call History
+                </button>
+              </div>
+            )}
           </section>
         )}
 
@@ -1874,6 +2076,212 @@ function App() {
                 <Check size={16} />
               </button>
             </div>
+          </section>
+        </div>
+      )}
+
+      {/* ── PRIVACY POLICY MODAL ── */}
+      {privacyModalOpen && (
+        <div className="modal-backdrop" onClick={() => setPrivacyModalOpen(false)}>
+          <section
+            className="modal-card policy-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="privacy-modal-title"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="modal-header">
+              <div className="eyebrow">
+                <span className="eyebrow-dot" /> DRAFT · TRANSPARENCY & DATA GOVERNANCE
+              </div>
+              <h2 id="privacy-modal-title">[DRAFT] Privacy Policy & Data Architecture</h2>
+              <p>Draft pre-launch policy pending legal review and verified company details.</p>
+            </div>
+
+            <div className="policy-body">
+              <h3>1. Local-First Storage Architecture</h3>
+              <p>
+                ColdCall Companion operates as a client-first productivity tool. When you start an outbound call and log prospect details, conversation stages, or verbatim notes, all data is immediately written to your browser’s local storage (<code>localStorage</code>).
+              </p>
+
+              <h3>2. Cloud Synchronization & Token Isolation</h3>
+              <p>
+                When cloud connectivity is configured, your completed calls are synchronized to a private PostgreSQL database (Supabase) via secure HTTPS RPC transactions. Access is strictly isolated by your secret Caller Bearer Token (<code>X-Caller-Token</code>). There is no public or unauthenticated read access to your call history.
+              </p>
+
+              <h3>3. No Audio or Voice Recording</h3>
+              <p>
+                ColdCall Companion is a manual visual guide and notes companion. The application does not intercept phone calls, does not record audio, and does not access your microphone. All logged quotes and stages are typed or selected manually by the caller.
+              </p>
+
+              <h3>4. Optional AI Advisory Analysis</h3>
+              <p>
+                If the operator requests an AI post-call review, the typed notes and stage progression are sent to an LLM provider (Anthropic Claude API) solely to generate the structured coaching summary. These summaries are advisory only.
+              </p>
+
+              <h3>5. Analytics & Cookies</h3>
+              <p>
+                ColdCall Companion does not track you across other websites or sell caller data. Optional Google Analytics is completely disabled by default and only activates if a measurement ID is explicitly configured by the site operator, with IP anonymization enabled.
+              </p>
+
+              <h3>6. Data Retention, Clearing, and Erasure</h3>
+              <p>
+                <strong>Local Caller Token:</strong> Clicking “Clear Token” in the Caller Token settings removes your credentials from this browser session to prevent unauthorized access to cloud records. <em>Clearing your token does not delete existing local or cloud call records.</em>
+              </p>
+              <p>
+                <strong>Local Call Storage:</strong> Offline call history and stage progress are retained in your browser’s <code>localStorage</code>. To delete all local records from this device, clear your browser’s site storage/cookies for this domain.
+              </p>
+              <p>
+                <strong>Server-Side Cloud Records:</strong> For permanent erasure of synced call records from the remote PostgreSQL database, contact your organization’s system administrator with your Caller ID.
+              </p>
+
+              <h3>7. Contact & Support Submissions</h3>
+              <p>
+                When you submit an inquiry through the Contact & Support modal:
+              </p>
+              <ul>
+                <li><strong>Information Collected:</strong> Your name (optional), email address (required), and message text along with a submission timestamp.</li>
+                <li><strong>Destination & Dispatch:</strong> Inquiries are transmitted via secure HTTPS to the operator’s designated server-side support webhook (such as a private Slack channel or support desk). Secrets and endpoints are kept strictly server-side.</li>
+                <li><strong>Purpose & Retention:</strong> Submissions are used solely to answer inquiries, debug technical issues, and review feedback. Contact details are retained according to the operator’s internal support schedule and are never sold or shared with third-party advertisers.</li>
+              </ul>
+
+              <div className="policy-meta-box">
+                <strong>DRAFT — OPERATOR INPUT REQUIRED BEFORE PUBLIC LAUNCH:</strong><br />
+                • Organization Legal Name: <em>[Needs User/Operator Input]</em><br />
+                • Contact/Privacy Email: <em>[Needs User/Operator Input]</em><br />
+                • Registered Business Address: <em>[Needs User/Operator Input]</em><br />
+                • Effective Date: Draft — Pending Launch Approval
+              </div>
+            </div>
+
+            <div className="modal-footer">
+              <button
+                className="primary-button"
+                type="button"
+                onClick={() => setPrivacyModalOpen(false)}
+              >
+                <span>Close</span>
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {/* ── CONTACT & FEEDBACK MODAL ── */}
+      {contactModalOpen && (
+        <div className="modal-backdrop" onClick={() => setContactModalOpen(false)}>
+          <section
+            className="modal-card contact-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="contact-modal-title"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="modal-header">
+              <div className="eyebrow">
+                <span className="eyebrow-dot" /> SUPPORT & FEEDBACK
+              </div>
+              <h2 id="contact-modal-title">Contact ColdCall Companion</h2>
+              <p>Send a question, feature request, or report an issue with the companion.</p>
+            </div>
+
+            {contactStatus.state === 'success' && (
+              <div className="contact-success-banner" role="status">
+                <Check size={16} />
+                <span>{contactStatus.message}</span>
+              </div>
+            )}
+
+            {contactStatus.state === 'unconfigured' && (
+              <div className="contact-unconfigured-banner" style={{ background: '#fdf8ea', border: '1px solid #ebd99f', padding: '10px 14px', borderRadius: 4, color: '#7c5e10', fontSize: 13, marginBottom: 14, display: 'flex', alignItems: 'center', gap: 8 }} role="alert">
+                <AlertTriangle size={16} />
+                <span>{contactStatus.message}</span>
+              </div>
+            )}
+
+            {contactStatus.state === 'error' && (
+              <div className="contact-error-banner" style={{ color: '#b33924', marginBottom: 12, fontSize: 13 }} role="alert">
+                <AlertTriangle size={15} style={{ verticalAlign: 'middle', marginRight: 6 }} />
+                <span>{contactStatus.message}</span>
+              </div>
+            )}
+
+            <form onSubmit={handleContactSubmit}>
+              {/* Spam Protection Honeypot field (hidden from real users) */}
+              <input
+                type="text"
+                name="b_website"
+                className="visually-hidden"
+                tabIndex={-1}
+                autoComplete="off"
+                value={contactForm.honeypot}
+                onChange={e => setContactForm({ ...contactForm, honeypot: e.target.value })}
+              />
+
+              <label className="textarea-label" htmlFor="contact-name-input">
+                YOUR NAME <span>OPTIONAL</span>
+              </label>
+              <input
+                id="contact-name-input"
+                type="text"
+                className="contact-input"
+                placeholder="e.g. Alex Morgan"
+                value={contactForm.name}
+                onChange={e => setContactForm({ ...contactForm, name: e.target.value })}
+              />
+
+              <label className="textarea-label" htmlFor="contact-email-input">
+                YOUR EMAIL <span>REQUIRED</span>
+              </label>
+              <input
+                id="contact-email-input"
+                type="email"
+                required
+                className="contact-input"
+                placeholder="e.g. alex@company.com"
+                value={contactForm.email}
+                onChange={e => setContactForm({ ...contactForm, email: e.target.value })}
+              />
+
+              <label className="textarea-label" htmlFor="contact-message-input">
+                MESSAGE <span>REQUIRED</span>
+              </label>
+              <textarea
+                id="contact-message-input"
+                required
+                className="contact-textarea"
+                placeholder="Tell us how we can help or what you would like improved…"
+                value={contactForm.message}
+                onChange={e => setContactForm({ ...contactForm, message: e.target.value })}
+              />
+
+              <div className="modal-footer">
+                <button
+                  className="quiet-button"
+                  type="button"
+                  onClick={() => setContactModalOpen(false)}
+                >
+                  Cancel
+                </button>
+                <button
+                  className="primary-button"
+                  type="submit"
+                  disabled={contactStatus.state === 'submitting'}
+                >
+                  {contactStatus.state === 'submitting' ? (
+                    <>
+                      <RefreshCw size={15} className="spin" />
+                      <span>Sending…</span>
+                    </>
+                  ) : (
+                    <>
+                      <Mail size={15} />
+                      <span>Send Message</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </form>
           </section>
         </div>
       )}

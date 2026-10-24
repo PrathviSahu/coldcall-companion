@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <rect width="1200" height="630" fill="#20251f"/>
+  <rect x="30" y="30" width="1140" height="570" rx="16" fill="#f5f4f0"/>
+  <text x="90" y="130" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="18" font-weight="700" fill="#31563e" letter-spacing="3">OUTBOUND COLD-CALL SIDE SCREEN</text>
+  <text x="90" y="230" font-family="Georgia, 'Playfair Display', serif" font-size="72" font-weight="600" fill="#20251f">Stay with the</text>
+  <text x="90" y="310" font-family="Georgia, 'Playfair Display', serif" font-style="italic" font-size="72" font-weight="500" fill="#31563e">conversation.</text>
+  <text x="90" y="390" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="26" fill="#757970">A calm, editorial guide for live outbound calls. Follow the 8 proven stages,</text>
+  <text x="90" y="430" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="26" fill="#757970">anticipate prospect objections, log exact words, and never split your attention.</text>
+  <rect x="90" y="480" width="280" height="54" rx="27" fill="#20251f"/>
+  <text x="130" y="514" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="18" font-weight="600" fill="#f5f4f0">Sidecall Companion</text>
+</svg>
