@@ -563,53 +563,59 @@ function App() {
     };
 
     setSavingStage(true);
-
-    let syncSucceeded = false;
-    if (!call.isLocal) {
-      try {
-        await request(`/calls/${call.id}/stage-results`, {
-          method: 'POST',
-          body: JSON.stringify({
-            stage_id: currentStageId,
-            result: chosenResult,
-            prospect_words: wordsToSave || '',
-            notes: notesToSave || '',
-          }),
-        });
-        syncSucceeded = true;
-      } catch (e) {
-        console.warn('Backend stage sync failed, draft preserved locally:', e.message);
-        stagePayload.sync_error = e.message;
-      }
-    }
-    stagePayload.synced = syncSucceeded;
-
-    // Update local state map
-    const updated = {
-      ...stageResultsRef.current,
-      [currentStageId]: stagePayload,
-    };
-    stageResultsRef.current = updated;
-    setStageResults(updated);
-
-    // Re-evaluate unsynced status across all stages
-    evaluateUnsyncedState(updated, call);
-
-    // Mirror to localStorage
+    let updated = stageResultsRef.current;
     try {
-      const existingHistory = JSON.parse(localStorage.getItem('sidecall-history') || '[]');
-      const updatedRecord = {
-        ...call,
-        current_stage_id: currentStageId,
-        stage_results: Object.values(updated),
-      };
-      const filtered = existingHistory.filter(c => c.id !== call.id);
-      localStorage.setItem('sidecall-history', JSON.stringify([updatedRecord, ...filtered]));
-    } catch (e) {
-      console.warn('LocalStorage write failed:', e);
-    }
+      let syncSucceeded = false;
+      if (!call.isLocal) {
+        try {
+          await request(`/calls/${call.id}/stage-results`, {
+            method: 'POST',
+            body: JSON.stringify({
+              stage_id: currentStageId,
+              result: chosenResult,
+              prospect_words: wordsToSave || '',
+              notes: notesToSave || '',
+            }),
+          });
+          syncSucceeded = true;
+        } catch (e) {
+          console.warn('Backend stage sync failed, draft preserved locally:', e.message);
+          stagePayload.sync_error = e.message;
+        }
+      }
+      stagePayload.synced = syncSucceeded;
 
-    setSavingStage(false);
+      // Update local state map
+      updated = {
+        ...stageResultsRef.current,
+        [currentStageId]: stagePayload,
+      };
+      stageResultsRef.current = updated;
+      setStageResults(updated);
+
+      // Re-evaluate unsynced status across all stages
+      try {
+        evaluateUnsyncedState(updated, call);
+      } catch (e) {
+        console.warn('evaluateUnsyncedState failed:', e);
+      }
+
+      // Mirror to localStorage
+      try {
+        const existingHistory = JSON.parse(localStorage.getItem('sidecall-history') || '[]');
+        const updatedRecord = {
+          ...call,
+          current_stage_id: currentStageId,
+          stage_results: Object.values(updated),
+        };
+        const filtered = existingHistory.filter(c => c.id !== call.id);
+        localStorage.setItem('sidecall-history', JSON.stringify([updatedRecord, ...filtered]));
+      } catch (e) {
+        console.warn('LocalStorage write failed:', e);
+      }
+    } finally {
+      setSavingStage(false);
+    }
     return updated;
   }
 
@@ -711,7 +717,15 @@ function App() {
     const currentNotes = notes;
     const currentTap = selectedTap;
 
-    const freshResults = await performSaveStage(currentWords, currentNotes, currentTap);
+    let freshResults;
+    try {
+      freshResults = await performSaveStage(currentWords, currentNotes, currentTap);
+    } catch (e) {
+      console.warn('performSaveStage failed:', e);
+      freshResults = stageResultsRef.current;
+    } finally {
+      setSavingStage(false);
+    }
 
     // 2. Load the target stage's stored data
     const targetStage = stages[safeIndex];
@@ -737,12 +751,6 @@ function App() {
     setError('');
 
     const token = getCallerToken();
-    if (!token) {
-      setError('Authentication required: Please configure your caller token in Caller Profile before starting a call.');
-      setAuthModalOpen(true);
-      return;
-    }
-
     setBusy(true);
 
     const firstStage = stages[0] || STAGE_SEED[0];
@@ -759,31 +767,41 @@ function App() {
       sync_status: 'unsynced',
     };
 
-    try {
-      const created = await request('/calls', {
-        method: 'POST',
-        body: JSON.stringify({
-          client_call_id: clientCallId,
-          prospect_name: fields.prospect_name.trim() || null,
-          company_name: fields.company_name.trim() || null,
-        }),
-      });
-      setActiveCall({ ...created, isLocal: false });
-      setApiState('connected');
-      setHasUnsyncedStage(false);
-      setSyncError('');
-    } catch (err) {
-      if (err.status === 401) {
-        setError('Authentication failed (401): Caller token is invalid or unauthorized. Please click Caller Profile to enter a valid token.');
-        setAuthModalOpen(true);
-        setBusy(false);
-        return;
+    if (token) {
+      try {
+        const created = await request('/calls', {
+          method: 'POST',
+          body: JSON.stringify({
+            client_call_id: clientCallId,
+            prospect_name: fields.prospect_name.trim() || null,
+            company_name: fields.company_name.trim() || null,
+          }),
+        });
+        setActiveCall({ ...created, isLocal: false });
+        setApiState('connected');
+        setHasUnsyncedStage(false);
+        setSyncError('');
+      } catch (err) {
+        if (err.status === 401) {
+          console.warn('Caller token unauthorized (401), running in local offline mode:', err.message);
+          setActiveCall(localCallRecord);
+          setApiState('offline');
+          setHasUnsyncedStage(true);
+          setError('Caller token unauthorized (401). Call running locally in offline mode — notes preserved in browser.');
+        } else {
+          setActiveCall(localCallRecord);
+          setApiState('offline');
+          setHasUnsyncedStage(true);
+          setSyncError('Backend unavailable. Call running in offline mode. Notes will be preserved in browser memory.');
+          setError('Backend unavailable. Call is running locally in this browser and will be stored securely in local memory.');
+        }
       }
+    } else {
+      // Offline / guest mode when no caller token configured
       setActiveCall(localCallRecord);
-      setApiState('offline');
+      setApiState('local');
       setHasUnsyncedStage(true);
-      setSyncError('Backend unavailable. Call running in offline mode. Notes will be preserved in browser memory.');
-      setError('Backend unavailable. Call is running locally in this browser and will be stored securely in local memory.');
+      setSyncError('Running in local offline mode. To sync call history to the cloud, configure your Caller Token in Caller Profile.');
     }
 
     setActiveIndex(0);
