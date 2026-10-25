@@ -244,8 +244,10 @@ function localId() {
   return generateClientCallId();
 }
 
-function initials(name = '') {
-  return name.trim().split(/\s+/).slice(0, 2).map(x => x[0]?.toUpperCase()).join('') || 'PC';
+function initials(name) {
+  const safeName = (typeof name === 'string' ? name : '').trim();
+  if (!safeName) return 'PC';
+  return safeName.split(/\s+/).slice(0, 2).map(x => x[0]?.toUpperCase()).join('') || 'PC';
 }
 
 function formatDate(value) {
@@ -2307,4 +2309,39 @@ function App() {
   );
 }
 
-createRoot(document.getElementById('root')).render(<App />);
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false };
+  }
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+  componentDidCatch(error, info) {
+    console.error('Sidecall view error caught by boundary:', error, info);
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ padding: '60px 20px', textAlign: 'center', fontFamily: 'Inter, system-ui, sans-serif', maxWidth: '520px', margin: '80px auto' }}>
+          <h2 style={{ fontSize: '20px', color: '#111827', marginBottom: '8px' }}>Something went wrong</h2>
+          <p style={{ color: '#6b7280', fontSize: '14px', marginBottom: '20px' }}>Your saved notes and call records are intact. Please reload to continue.</p>
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            style={{ padding: '10px 18px', background: '#0f172a', color: '#fff', borderRadius: '6px', border: 'none', cursor: 'pointer', fontWeight: 500 }}
+          >
+            Reload Companion
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+createRoot(document.getElementById('root')).render(
+  <ErrorBoundary>
+    <App />
+  </ErrorBoundary>
+);
