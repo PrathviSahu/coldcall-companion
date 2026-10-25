@@ -788,9 +788,8 @@ async def generate_ai_summary(
     if call.get("ai_summary") and not payload.refresh:
         return {"status": "ready", "configured": True, "summary": call["ai_summary"], "cached": True}
 
-    api_key = os.getenv("LLM_API_KEY")
-    api_url = os.getenv("LLM_API_URL", "https://api.openai.com/v1/chat/completions")
-    model = os.getenv("LLM_MODEL", "gpt-4o-mini")
+    raw_key = os.getenv("LLM_API_KEY")
+    api_key = (raw_key or "").strip().strip("\"'").strip()
 
     if not api_key:
         return {
@@ -800,6 +799,29 @@ async def generate_ai_summary(
             "summary": None,
             "cached": False
         }
+
+    configured_url = os.getenv("LLM_API_URL")
+    configured_model = os.getenv("LLM_MODEL")
+
+    if configured_url and configured_url.strip():
+        api_url = configured_url.strip()
+        model = configured_model.strip() if configured_model and configured_model.strip() else "gpt-4o-mini"
+    elif api_key.startswith("AIzaSy"):
+        # Auto-route Google Gemini API keys to Gemini's OpenAI-compatible completions endpoint
+        api_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        model = configured_model.strip() if configured_model and configured_model.strip() else "gemini-1.5-flash"
+    elif api_key.startswith("gsk_"):
+        # Auto-route Groq API keys
+        api_url = "https://api.groq.com/openai/v1/chat/completions"
+        model = configured_model.strip() if configured_model and configured_model.strip() else "llama-3.3-70b-versatile"
+    elif api_key.startswith("sk-or-"):
+        # Auto-route OpenRouter API keys
+        api_url = "https://openrouter.ai/api/v1/chat/completions"
+        model = configured_model.strip() if configured_model and configured_model.strip() else "openai/gpt-4o-mini"
+    else:
+        # Default: OpenAI
+        api_url = "https://api.openai.com/v1/chat/completions"
+        model = configured_model.strip() if configured_model and configured_model.strip() else "gpt-4o-mini"
 
     stage_rows = d.table("call_stage_results").select("stage_id,result,prospect_words,notes,created_at").eq("call_id", str(call_id)).order("created_at").execute().data or []
     safe_input = {
@@ -836,7 +858,17 @@ async def generate_ai_summary(
             content = response.json()["choices"][0]["message"]["content"]
             summary = json.loads(content)
     except httpx.HTTPStatusError as exc:
-        raise HTTPException(502, f"LLM provider returned HTTP {exc.response.status_code}") from exc
+        err_detail = ""
+        try:
+            body = exc.response.json()
+            if isinstance(body, dict):
+                err_detail = body.get("error", {}).get("message") or body.get("message") or ""
+        except Exception:
+            err_detail = exc.response.text[:120].strip()
+        detail_msg = f"LLM provider returned HTTP {exc.response.status_code}"
+        if err_detail:
+            detail_msg += f": {err_detail}"
+        raise HTTPException(502, detail_msg) from exc
     except (httpx.HTTPError, KeyError, IndexError, ValueError, TypeError) as exc:
         raise HTTPException(502, "Could not generate a valid AI debrief") from exc
 
