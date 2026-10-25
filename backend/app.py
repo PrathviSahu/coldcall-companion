@@ -809,7 +809,7 @@ async def generate_ai_summary(
     elif api_key.startswith("AIzaSy") or api_key.startswith("AQ.") or api_key.startswith("AQ"):
         # Auto-route Google Gemini API keys to Gemini's OpenAI-compatible completions endpoint
         api_url = "https://generativelanguage.googleapis.com/v1beta/chat/completions"
-        model = configured_model.strip() if configured_model and not configured_model.lower().startswith("gpt") else "gemini-1.5-flash"
+        model = configured_model.strip() if configured_model and not configured_model.lower().startswith("gpt") else "gemini-2.5-flash"
     elif api_key.startswith("gsk_"):
         # Auto-route Groq API keys
         api_url = "https://api.groq.com/openai/v1/chat/completions"
@@ -841,20 +841,41 @@ async def generate_ai_summary(
     )
     try:
         async with httpx.AsyncClient(timeout=25) as client:
-            response = await client.post(
-                api_url,
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={
-                    "model": model,
-                    "temperature": 0.2,
-                    "response_format": {"type": "json_object"},
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": json.dumps(safe_input, ensure_ascii=False)},
-                    ],
-                },
-            )
-            response.raise_for_status()
+            try:
+                response = await client.post(
+                    api_url,
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json={
+                        "model": model,
+                        "temperature": 0.2,
+                        "response_format": {"type": "json_object"},
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": json.dumps(safe_input, ensure_ascii=False)},
+                        ],
+                    },
+                )
+                response.raise_for_status()
+            except httpx.HTTPStatusError as initial_err:
+                if initial_err.response.status_code == 404 and (api_key.startswith("AIzaSy") or api_key.startswith("AQ")):
+                    fallback_model = "gemini-2.0-flash" if model != "gemini-2.0-flash" else "gemini-2.5-flash"
+                    response = await client.post(
+                        api_url,
+                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                        json={
+                            "model": fallback_model,
+                            "temperature": 0.2,
+                            "response_format": {"type": "json_object"},
+                            "messages": [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": json.dumps(safe_input, ensure_ascii=False)},
+                            ],
+                        },
+                    )
+                    response.raise_for_status()
+                    model = fallback_model
+                else:
+                    raise
             content = response.json()["choices"][0]["message"]["content"]
             summary = json.loads(content)
     except httpx.HTTPStatusError as exc:
