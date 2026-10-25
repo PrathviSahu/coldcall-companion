@@ -877,7 +877,15 @@ async def generate_ai_summary(
                 else:
                     raise
             content = response.json()["choices"][0]["message"]["content"]
-            summary = json.loads(content)
+            clean_content = content.strip()
+            if clean_content.startswith("```json"):
+                clean_content = clean_content[7:]
+            elif clean_content.startswith("```"):
+                clean_content = clean_content[3:]
+            if clean_content.endswith("```"):
+                clean_content = clean_content[:-3]
+            clean_content = clean_content.strip()
+            summary = json.loads(clean_content)
     except httpx.HTTPStatusError as exc:
         err_detail = ""
         try:
@@ -893,7 +901,7 @@ async def generate_ai_summary(
             detail_msg += f": {err_detail}"
         raise HTTPException(502, detail_msg) from exc
     except (httpx.HTTPError, KeyError, IndexError, ValueError, TypeError) as exc:
-        raise HTTPException(502, "Could not generate a valid AI debrief") from exc
+        raise HTTPException(502, f"Could not generate a valid AI debrief: {exc}") from exc
 
     summary["model"] = model
     summary["generated_at"] = datetime.now(timezone.utc).isoformat()
