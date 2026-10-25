@@ -2,6 +2,9 @@
 
 A focused, editorial live-call side screen for outbound callers reaching Indian business leaders. Follow the eight proven call stages, anticipate aggregated prospect response patterns derived from 100 empirical transcripts, log single-tap outcomes and exact verbatim prospect words, and review completed and abandoned calls.
 
+- **Live Application (Vercel)**: [https://coldcall-companion.vercel.app/](https://coldcall-companion.vercel.app/)
+- **Live API Backend (Render)**: [https://coldcall-companion.onrender.com/](https://coldcall-companion.onrender.com/)
+- **API Health Check**: [https://coldcall-companion.onrender.com/health](https://coldcall-companion.onrender.com/health)
 - **GitHub Repository**: [https://github.com/PrathviSahu/coldcall-companion](https://github.com/PrathviSahu/coldcall-companion)
 
 ---
