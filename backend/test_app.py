@@ -1883,16 +1883,10 @@ def test_start_call_competing_insert_recovers_existing_call(mock_db, monkeypatch
     race_first_select_done = False
 
     class RaceTableQuery(MockTableQuery):
-        def maybe_single(self):
-            super().maybe_single()
-            nonlocal race_first_select_done
-            if not race_first_select_done:
-                self._force_empty_select = True
-                race_first_select_done = True
-            return self
-
         def execute(self):
-            if getattr(self, "_force_empty_select", False) and self._action == "select":
+            nonlocal race_first_select_done
+            if not race_first_select_done and self._action == "select":
+                race_first_select_done = True
                 class EmptyResult:
                     data = None
                     count = 0

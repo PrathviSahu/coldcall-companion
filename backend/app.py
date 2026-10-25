@@ -323,6 +323,19 @@ class UpdateStage(BaseModel):
     stage_id: str
 
 
+def fetch_one(query: Any) -> dict[str, Any] | None:
+    """Executes a Supabase table query and returns the first matching record dict, or None."""
+    res = query.execute()
+    data = res.data
+    if not data:
+        return None
+    if isinstance(data, list):
+        return data[0] if len(data) > 0 else None
+    if isinstance(data, dict):
+        return data
+    return None
+
+
 def db() -> Client:
     if supabase is None:
         raise HTTPException(
@@ -394,14 +407,11 @@ def start_call(payload: StartCall, caller: Caller = Depends(get_current_caller))
 
     # Idempotency check if client_call_id is provided
     if clean_client_id:
-        existing = (
+        existing = fetch_one(
             d.table("calls")
             .select("*")
             .eq("caller_id", caller.id)
             .eq("client_call_id", clean_client_id)
-            .maybe_single()
-            .execute()
-            .data
         )
         if existing:
             return existing
@@ -427,17 +437,14 @@ def start_call(payload: StartCall, caller: Caller = Depends(get_current_caller))
         err_msg = str(exc)
         # Safely handle concurrent race on unique index (caller_id, client_call_id)
         if clean_client_id and ("calls_client_call_id_idx" in err_msg or "23505" in err_msg or "duplicate key" in err_msg.lower()):
-            existing = (
+            existing = fetch_one(
                 d.table("calls")
                 .select("*")
                 .eq("caller_id", caller.id)
                 .eq("client_call_id", clean_client_id)
-                .maybe_single()
-                .execute()
-                .data
             )
             if existing:
-                return existing[0] if isinstance(existing, list) else existing
+                return existing
         raise HTTPException(500, f"Could not create call: {exc}")
 
 
@@ -453,7 +460,7 @@ def save_stage(
     if payload.stage_id not in valid_stages:
         raise HTTPException(400, f"Unknown stage_id: {payload.stage_id}")
 
-    call = d.table("calls").select("id,caller_id,ended_at").eq("id", str(call_id)).maybe_single().execute().data
+    call = fetch_one(d.table("calls").select("id,caller_id,ended_at").eq("id", str(call_id)))
     if not call:
         raise HTTPException(404, "Call not found")
     if call.get("caller_id") != caller.id and caller.role != "admin":
@@ -488,7 +495,7 @@ def set_current_stage(
     if payload.stage_id not in valid_stages:
         raise HTTPException(400, f"Unknown stage_id: {payload.stage_id}")
 
-    call = d.table("calls").select("id,caller_id,ended_at").eq("id", str(call_id)).maybe_single().execute().data
+    call = fetch_one(d.table("calls").select("id,caller_id,ended_at").eq("id", str(call_id)))
     if not call:
         raise HTTPException(404, "Call not found")
     if call.get("caller_id") != caller.id and caller.role != "admin":
@@ -566,7 +573,7 @@ def close_call(
             raise HTTPException(500, f"Could not close call: {exc}")
 
     # 2. Atomic Conditional Table Update (Defense-in-depth / Mock fallback)
-    call = d.table("calls").select("id,caller_id,ended_at,outcome,outcome_notes").eq("id", str(call_id)).maybe_single().execute().data
+    call = fetch_one(d.table("calls").select("id,caller_id,ended_at,outcome,outcome_notes").eq("id", str(call_id)))
     if not call:
         raise HTTPException(404, "Call not found")
     if call.get("caller_id") != caller.id and caller.role != "admin":
@@ -578,7 +585,7 @@ def close_call(
         )
     if call.get("ended_at") is not None or call.get("outcome") is not None:
         if call.get("outcome") == payload.outcome:
-            full = d.table("calls").select("*").eq("id", str(call_id)).maybe_single().execute().data
+            full = fetch_one(d.table("calls").select("*").eq("id", str(call_id)))
             return full or call
         raise HTTPException(
             status_code=409,
@@ -594,7 +601,7 @@ def close_call(
 
     if not response.data:
         # Concurrent request finalized the call between read and update; re-check outcome
-        recheck = d.table("calls").select("*").eq("id", str(call_id)).maybe_single().execute().data
+        recheck = fetch_one(d.table("calls").select("*").eq("id", str(call_id)))
         if recheck and recheck.get("outcome") == payload.outcome:
             return recheck
         conflict_outcome = recheck.get("outcome") if recheck else "unknown"
@@ -751,7 +758,7 @@ def get_call(
 ) -> dict[str, Any]:
     """Retrieves full call details. Verifies caller ownership before returning record."""
     d = db()
-    row = d.table("calls").select("*").eq("id", str(call_id)).maybe_single().execute().data
+    row = fetch_one(d.table("calls").select("*").eq("id", str(call_id)))
     if not row:
         raise HTTPException(404, "Call not found")
     if row.get("caller_id") != caller.id and caller.role != "admin":
@@ -772,7 +779,7 @@ async def generate_ai_summary(
 ) -> dict[str, Any]:
     """Summarizes only the caller's saved notes; enforces caller ownership and never alters prospect quotations."""
     d = db()
-    call = d.table("calls").select("*").eq("id", str(call_id)).maybe_single().execute().data
+    call = fetch_one(d.table("calls").select("*").eq("id", str(call_id)))
     if not call:
         raise HTTPException(404, "Call not found")
     if call.get("caller_id") != caller.id and caller.role != "admin":
