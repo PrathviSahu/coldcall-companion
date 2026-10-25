@@ -806,7 +806,7 @@ async def generate_ai_summary(
     if configured_url and configured_url.strip():
         api_url = configured_url.strip()
         model = configured_model.strip() if configured_model and configured_model.strip() else "gpt-4o-mini"
-    elif api_key.startswith("AIzaSy"):
+    elif api_key.startswith("AIzaSy") or api_key.startswith("AQ.") or api_key.startswith("AQ"):
         # Auto-route Google Gemini API keys to Gemini's OpenAI-compatible completions endpoint
         api_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
         model = configured_model.strip() if configured_model and configured_model.strip() else "gemini-1.5-flash"
