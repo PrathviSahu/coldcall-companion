@@ -808,8 +808,8 @@ async def generate_ai_summary(
         model = configured_model.strip() if configured_model and configured_model.strip() else "gpt-4o-mini"
     elif api_key.startswith("AIzaSy") or api_key.startswith("AQ.") or api_key.startswith("AQ"):
         # Auto-route Google Gemini API keys to Gemini's OpenAI-compatible completions endpoint
-        api_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-        model = configured_model.strip() if configured_model and configured_model.strip() else "gemini-1.5-flash"
+        api_url = "https://generativelanguage.googleapis.com/v1beta/chat/completions"
+        model = configured_model.strip() if configured_model and not configured_model.lower().startswith("gpt") else "gemini-1.5-flash"
     elif api_key.startswith("gsk_"):
         # Auto-route Groq API keys
         api_url = "https://api.groq.com/openai/v1/chat/completions"
@@ -864,7 +864,9 @@ async def generate_ai_summary(
             if isinstance(body, dict):
                 err_detail = body.get("error", {}).get("message") or body.get("message") or ""
         except Exception:
-            err_detail = exc.response.text[:120].strip()
+            pass
+        if not err_detail:
+            err_detail = exc.response.text[:160].strip()
         detail_msg = f"LLM provider returned HTTP {exc.response.status_code}"
         if err_detail:
             detail_msg += f": {err_detail}"
